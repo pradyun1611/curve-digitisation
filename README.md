@@ -296,7 +296,7 @@ Example output structure:
   - Get conversational response for non-image queries
   - Returns: Plain text response from OpenAI GPT
 
-### image_processing.py
+### core/image_processor.py
 
 **CurveDigitizer** class handles image analysis and curve extraction.
 
