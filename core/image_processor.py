@@ -7,6 +7,7 @@ Handles image digitization and curve fitting:
 - Pixel-to-coordinate normalization
 - RANSAC noise removal
 - Polynomial curve fitting
+- Digitized graph generation
 """
 
 import numpy as np
@@ -16,6 +17,10 @@ from typing import List, Tuple, Dict, Any, Optional
 from pathlib import Path
 from sklearn.linear_model import RANSACRegressor
 from sklearn.preprocessing import PolynomialFeatures
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for server/headless use
+import matplotlib.pyplot as plt
+from datetime import datetime
 
 
 class CurveDigitizer:
@@ -81,16 +86,15 @@ class CurveDigitizer:
         # Define color ranges (RGB thresholds)
         color_ranges = {
             'red': {'r_min': 200, 'r_max': 255, 'g_max': 100, 'b_max': 100},
-            'blue': {'b_min': 200, 'b_max': 255, 'r_max': 100, 'g_max': 150},
+            'blue': {'b_min': 150, 'b_max': 255, 'r_max': 50, 'g_max': 80},
             'green': {'g_min': 200, 'g_max': 255, 'r_max': 100, 'b_max': 100},
             'yellow': {'r_min': 200, 'g_min': 200, 'b_max': 100},
             'orange': {'r_min': 200, 'g_min': 100, 'g_max': 200, 'b_max': 50},
             'purple': {'r_min': 150, 'b_min': 150, 'g_max': 100},
-            'black': {'r_max': 50, 'g_max': 50, 'b_max': 50},
             'gray': {'r_min': 100, 'r_max': 200, 'g_min': 100, 'g_max': 200, 'b_min': 100, 'b_max': 200},
             'magenta': {'r_min': 180, 'r_max': 255, 'g_max': 100, 'b_min': 180, 'b_max': 255},
             'pink': {'r_min': 200, 'r_max': 255, 'g_max': 150, 'b_min': 150, 'b_max': 255},
-            'light blue': {'r_max': 150, 'g_min': 150, 'g_max': 255, 'b_min': 200, 'b_max': 255},
+            'light blue': {'r_min': 130, 'r_max': 180, 'g_min': 130, 'g_max': 180, 'b_min': 235, 'b_max': 255},
             'cyan': {'r_max': 100, 'g_min': 180, 'g_max': 255, 'b_min': 200, 'b_max': 255},
             'light green': {'r_min': 100, 'r_max': 200, 'g_min': 200, 'g_max': 255, 'b_max': 150},
             'dark blue': {'r_max': 50, 'g_max': 50, 'b_min': 150, 'b_max': 255},
@@ -313,7 +317,84 @@ class CurveDigitizer:
         
         return " + ".join(terms).replace("+ -", "- ")
     
+    def generate_digitized_graphs(self, results: Dict[str, Any], instance_dir: str, 
+                                   timestamp: str) -> Dict[str, str]:
+        """
+        Generate a combined digitized output graph from fitted polynomial curves.
+        
+        Args:
+            results: Processing results dict with curves and fit data
+            instance_dir: Per-instance output directory for this processing run
+            timestamp: Timestamp string for filenames
+            
+        Returns:
+            Dictionary mapping graph names to file paths
+        """
+        instance_path = Path(instance_dir)
+        instance_path.mkdir(parents=True, exist_ok=True)
+        
+        saved_graphs = {}
+        curves_data = results.get('curves', {})
+        axis_info = results.get('axis_info', {})
+        
+        x_label = f"{axis_info.get('xUnit', 'X')}"
+        y_label = f"{axis_info.get('yUnit', 'Y')}"
+        description = axis_info.get('imageDescription', 'Performance Curve')
+        
+        # Map color names to matplotlib-compatible colors
+        color_map = {
+            'red': '#e74c3c', 'blue': '#2196F3', 'green': '#27ae60',
+            'yellow': '#f1c40f', 'orange': '#e67e22', 'purple': '#9b59b6',
+            'black': '#2c3e50', 'gray': '#95a5a6', 'magenta': '#e91e63',
+            'pink': '#ff69b4', 'light blue': '#03a9f4', 'cyan': '#00bcd4',
+            'light green': '#8bc34a', 'dark blue': '#1a237e', 'dark red': '#b71c1c',
+            'brown': '#795548', 'teal': '#009688',
+        }
+        
+        # ── Combined plot with all curves ──
+        fig, ax = plt.subplots(figsize=(10, 7))
+        has_valid_curves = False
+        
+        for color_name, curve_data in curves_data.items():
+            fit = curve_data.get('fit_result', {})
+            coeffs = fit.get('coefficients')
+            if coeffs is None:
+                continue
+            
+            fitted_points = fit.get('fitted_points', [])
+            if not fitted_points:
+                continue
+            
+            has_valid_curves = True
+            x_vals = [p['x'] for p in fitted_points]
+            y_vals = [p['y'] for p in fitted_points]
+            label_text = curve_data.get('label', color_name)
+            r_sq = fit.get('r_squared', 0)
+            plot_color = color_map.get(color_name.lower(), '#333333')
+            
+            ax.plot(x_vals, y_vals, color=plot_color, linewidth=2.5,
+                    label=f"{label_text} (R²={r_sq:.4f})")
+        
+        if has_valid_curves:
+            ax.set_xlabel(x_label, fontsize=12)
+            ax.set_ylabel(y_label, fontsize=12)
+            ax.set_title(f"Digitized Curves — {description}", fontsize=14, fontweight='bold')
+            ax.legend(loc='best', fontsize=9, framealpha=0.9)
+            ax.grid(True, alpha=0.3, linestyle='--')
+            ax.set_xlim(self.xMin, self.xMax)
+            ax.set_ylim(self.yMin, self.yMax)
+            fig.tight_layout()
+            
+            combined_path = str(instance_path / f"digitized_curves_{timestamp}.png")
+            fig.savefig(combined_path, dpi=150, bbox_inches='tight')
+            saved_graphs['all_curves'] = combined_path
+        
+        plt.close(fig)
+        
+        return saved_graphs
+    
     def process_curve_image(self, image_path: str, features: List[Dict], 
+                           output_dir: str = "./output/",
                            crop_box: Optional[Tuple[int, int, int, int]] = None) -> Dict[str, Any]:
         """
         Complete end-to-end processing of a curve image.
@@ -344,6 +425,10 @@ class CurveDigitizer:
                 color = curve_feature.get('color', 'unknown')
                 label = curve_feature.get('label', f'Curve {idx+1}')
                 
+                # Skip black — typically used for reference/axis lines, not data curves
+                if color.lower() == 'black':
+                    continue
+                
                 # Extract pixels
                 pixels = self.extract_color_pixels(image, color)
                 
@@ -372,5 +457,15 @@ class CurveDigitizer:
                     'cleaned_point_count': len(cleaned_coords),
                     'fit_result': fit_result
                 }
+        
+        # Create per-instance output folder
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        instance_dir = str(Path(output_dir) / timestamp)
+        Path(instance_dir).mkdir(parents=True, exist_ok=True)
+        
+        # Generate digitized output graph
+        saved_graphs = self.generate_digitized_graphs(results, instance_dir, timestamp)
+        results['output_graphs'] = saved_graphs
+        results['instance_dir'] = instance_dir
         
         return results

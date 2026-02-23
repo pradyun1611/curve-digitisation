@@ -78,14 +78,13 @@ def process_image_task(openai_client: OpenAIClient, image_path: str, user_query:
         features = openai_client.extract_curve_features(image_base64)
         curve_count = len(features.get('curves', []))
         
-        # Digitize curves
+        # Digitize curves and generate graphs
         digitizer = CurveDigitizer(axis_info)
-        results = digitizer.process_curve_image(image_path, features)
+        results = digitizer.process_curve_image(image_path, features, output_dir)
         
-        # Save results
-        ensure_output_dir(output_dir)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = Path(output_dir) / f"curve_digitization_{timestamp}.json"
+        # Save JSON results in the per-instance output folder
+        instance_dir = Path(results.get('instance_dir', output_dir))
+        output_file = instance_dir / "curve_digitization.json"
         
         with open(output_file, 'w') as f:
             json.dump(results, f, indent=2)
@@ -103,6 +102,13 @@ def process_image_task(openai_client: OpenAIClient, image_path: str, user_query:
             response += f"- {color.capitalize()}: {label}\n"
         
         response += f"\n**Results saved to:** {output_file}\n"
+        
+        # List generated graphs
+        output_graphs = results.get('output_graphs', {})
+        if output_graphs:
+            response += f"\n**Digitized graphs saved:**\n"
+            for name, path in output_graphs.items():
+                response += f"- {name}: {path}\n"
         
         return response
         

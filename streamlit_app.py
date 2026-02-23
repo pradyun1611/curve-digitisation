@@ -125,15 +125,14 @@ def process_image(client: OpenAIClient, image_file, user_query: str, output_dir:
         with st.spinner("Detecting curves..."):
             features = client.extract_curve_features(image_base64)
         
-        # Digitize curves
-        with st.spinner("Fitting polynomial curves..."):
+        # Digitize curves and generate graphs
+        with st.spinner("Fitting polynomial curves and generating graphs..."):
             digitizer = CurveDigitizer(axis_info)
-            results = digitizer.process_curve_image(temp_path, features)
+            results = digitizer.process_curve_image(temp_path, features, output_dir)
         
-        # Save results
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = Path(output_dir) / f"curve_digitization_{timestamp}.json"
+        # Save JSON results in the per-instance output folder
+        instance_dir = Path(results.get('instance_dir', output_dir))
+        output_file = instance_dir / "curve_digitization.json"
         
         with open(output_file, 'w') as f:
             json.dump(results, f, indent=2)

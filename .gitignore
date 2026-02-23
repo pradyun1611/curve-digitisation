@@ -29,7 +29,7 @@ build/
 .streamlit/
 
 # Output and input folders (except structure)
-output/**/*
+output/*/
 !output/.gitkeep
 input/**/*
 !input/.gitkeep
