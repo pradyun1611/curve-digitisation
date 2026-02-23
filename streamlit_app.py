@@ -107,9 +107,10 @@ def save_image_as_base64(image_file) -> str:
 def process_image(client: OpenAIClient, image_file, user_query: str, output_dir: str) -> dict:
     """Process uploaded image and extract curves."""
     try:
-        # Save uploaded image temporarily
-        temp_path = f"/tmp/{image_file.name}"
-        Path("/tmp").mkdir(exist_ok=True)
+        # Save uploaded image temporarily (cross-platform)
+        import tempfile
+        temp_dir = Path(tempfile.gettempdir())
+        temp_path = str(temp_dir / image_file.name)
         
         with open(temp_path, "wb") as f:
             f.write(image_file.getbuffer())

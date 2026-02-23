@@ -5,12 +5,46 @@ Provides utilities for interacting with Azure OpenAI API for:
 - Intent classification
 - Image analysis and feature extraction
 - Structured data field classification
+
+SSL NOTE
+-------
+Corporate proxies rewrite TLS certificates.  The SSL fix lives in
+``core/__init__.py`` (runs first), but as a safety net we also clean
+``SSL_CERT_FILE`` here and build the client with an ``httpx`` transport
+that has a generous timeout.  **Do not remove the block below.**
 """
+
+import os as _os
+
+# ── inline SSL guard (safety net – core/__init__.py should already have run) ──
+_sc = _os.environ.get("SSL_CERT_FILE")
+if _sc and not _os.path.exists(_sc):
+    del _os.environ["SSL_CERT_FILE"]
 
 from openai import AzureOpenAI
 import base64
 import json
 from typing import Dict, Any, Optional
+
+
+def _make_azure_client(api_key: str, api_version: str, endpoint: str) -> AzureOpenAI:
+    """Create an AzureOpenAI client with a resilient httpx transport."""
+    try:
+        import httpx
+        http_client = httpx.Client(timeout=httpx.Timeout(120.0, connect=30.0))
+        return AzureOpenAI(
+            api_key=api_key,
+            api_version=api_version,
+            azure_endpoint=endpoint,
+            http_client=http_client,
+        )
+    except Exception:
+        # Fallback: plain client (no custom timeout)
+        return AzureOpenAI(
+            api_key=api_key,
+            api_version=api_version,
+            azure_endpoint=endpoint,
+        )
 
 
 class OpenAIClient:
@@ -30,11 +64,7 @@ class OpenAIClient:
         self.endpoint = endpoint
         self.deployment_name = deployment_name
         self.api_version = api_version
-        self.client = AzureOpenAI(
-            api_key=api_key,
-            api_version=api_version,
-            azure_endpoint=endpoint
-        )
+        self.client = _make_azure_client(api_key, api_version, endpoint)
     
     def classify_intent(self, query: str) -> str:
         """
