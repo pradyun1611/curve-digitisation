@@ -36,7 +36,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS
+# Custom CSS - Adaptive dark/light mode
 st.markdown("""
     <style>
     .stMessage {
@@ -44,14 +44,35 @@ st.markdown("""
         border-radius: 0.5rem;
         margin: 0.5rem 0;
     }
-    .user-message {
-        background-color: #e3f2fd;
-        border-left: 4px solid #2196F3;
+    
+    /* Light mode */
+    @media (prefers-color-scheme: light) {
+        .user-message {
+            background-color: #bbdefb;
+            border-left: 4px solid #1976d2;
+            color: #0d47a1;
+        }
+        .bot-message {
+            background-color: #c8e6c9;
+            border-left: 4px solid #388e3c;
+            color: #1b5e20;
+        }
     }
-    .bot-message {
-        background-color: #f5f5f5;
-        border-left: 4px solid #4CAF50;
+    
+    /* Dark mode */
+    @media (prefers-color-scheme: dark) {
+        .user-message {
+            background-color: #1565c0;
+            border-left: 4px solid #64b5f6;
+            color: #e3f2fd;
+        }
+        .bot-message {
+            background-color: #2e7d32;
+            border-left: 4px solid #81c784;
+            color: #e8f5e9;
+        }
     }
+    
     .success {
         color: #4CAF50;
         font-weight: bold;
