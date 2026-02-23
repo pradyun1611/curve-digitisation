@@ -264,8 +264,88 @@ class CurveDigitizer:
         
         return pixels
     
+    def detect_plot_area(self, image: Image.Image, dark_threshold: int = 80,
+                         line_ratio: float = 0.3) -> Tuple[int, int, int, int]:
+        """
+        Detect the actual plot/chart area boundaries in pixel coordinates.
+        
+        Finds axis lines (dark horizontal/vertical lines) to determine where
+        the plot region starts and ends, excluding labels, titles, and margins.
+        
+        Args:
+            image: PIL Image object
+            dark_threshold: Max brightness to consider a pixel as 'dark' (axis line)
+            line_ratio: Min fraction of row/col that must be dark to count as axis line
+            
+        Returns:
+            Tuple (plot_left, plot_top, plot_right, plot_bottom) in pixel coordinates
+        """
+        img_array = np.array(image)
+        height, width = img_array.shape[:2]
+        
+        # Convert to grayscale brightness
+        if img_array.ndim == 3:
+            gray = np.mean(img_array[:, :, :3], axis=2)
+        else:
+            gray = img_array.astype(float)
+        
+        # Create dark pixel mask
+        dark_mask = gray < dark_threshold
+        
+        # ─── Detect horizontal axis lines ───
+        # Count dark pixels per row
+        dark_per_row = np.sum(dark_mask, axis=1)
+        min_dark_h = int(width * line_ratio)
+        horizontal_line_rows = np.where(dark_per_row >= min_dark_h)[0]
+        
+        # ─── Detect vertical axis lines ───
+        # Count dark pixels per column
+        dark_per_col = np.sum(dark_mask, axis=0)
+        min_dark_v = int(height * line_ratio)
+        vertical_line_cols = np.where(dark_per_col >= min_dark_v)[0]
+        
+        # ─── Determine plot boundaries ───
+        # Default: use 10% margins as fallback
+        plot_left = int(width * 0.10)
+        plot_right = int(width * 0.90)
+        plot_top = int(height * 0.05)
+        plot_bottom = int(height * 0.85)
+        
+        if len(vertical_line_cols) > 0:
+            # Left axis = leftmost cluster of vertical lines
+            # Right boundary = rightmost vertical line (if box plot) or use right margin
+            left_candidates = vertical_line_cols[vertical_line_cols < width // 2]
+            right_candidates = vertical_line_cols[vertical_line_cols > width // 2]
+            
+            if len(left_candidates) > 0:
+                plot_left = int(np.max(left_candidates))  # rightmost edge of left axis line cluster
+            if len(right_candidates) > 0:
+                plot_right = int(np.min(right_candidates))  # leftmost edge of right boundary
+        
+        if len(horizontal_line_rows) > 0:
+            # Bottom axis = bottommost cluster of horizontal lines in lower half
+            # Top boundary = topmost horizontal line (if box plot) or use top margin
+            bottom_candidates = horizontal_line_rows[horizontal_line_rows > height // 2]
+            top_candidates = horizontal_line_rows[horizontal_line_rows < height // 2]
+            
+            if len(bottom_candidates) > 0:
+                plot_bottom = int(np.min(bottom_candidates))  # topmost edge of bottom axis line cluster
+            if len(top_candidates) > 0:
+                plot_top = int(np.max(top_candidates))  # bottommost edge of top boundary
+        
+        # Sanity checks: ensure reasonable boundaries
+        if plot_right - plot_left < width * 0.2:
+            plot_left = int(width * 0.10)
+            plot_right = int(width * 0.90)
+        if plot_bottom - plot_top < height * 0.2:
+            plot_top = int(height * 0.05)
+            plot_bottom = int(height * 0.85)
+        
+        return (plot_left, plot_top, plot_right, plot_bottom)
+    
     def normalize_to_axis(self, pixel_coords: List[Tuple[int, int]], 
-                         image_width: int, image_height: int) -> List[Tuple[float, float]]:
+                         image_width: int, image_height: int,
+                         plot_area: Optional[Tuple[int, int, int, int]] = None) -> List[Tuple[float, float]]:
         """
         Normalize pixel coordinates to axis coordinates.
         
@@ -273,20 +353,32 @@ class CurveDigitizer:
             pixel_coords: List of (pixel_x, pixel_y) tuples
             image_width: Image width in pixels
             image_height: Image height in pixels
+            plot_area: Optional (left, top, right, bottom) pixel bounds of actual plot region.
+                       If provided, mapping is relative to this region instead of full image.
             
         Returns:
             List of (axis_x, axis_y) tuples normalized to axis bounds
         """
         normalized = []
         
-        # Assume image coordinates: (0,0) at top-left, x increases right, y increases down
-        # Axis coordinates: typically x increases right, y increases up
-        # Need to flip y-axis
+        # Use plot area boundaries if available, else full image
+        if plot_area:
+            p_left, p_top, p_right, p_bottom = plot_area
+            p_width = p_right - p_left
+            p_height = p_bottom - p_top
+        else:
+            p_left, p_top = 0, 0
+            p_width = image_width
+            p_height = image_height
         
         for px, py in pixel_coords:
-            # Normalize pixel to 0-1 range
-            norm_x = px / image_width if image_width > 0 else 0
-            norm_y = 1 - (py / image_height) if image_height > 0 else 0  # Flip Y
+            # Normalize pixel relative to plot area to 0-1 range
+            norm_x = (px - p_left) / p_width if p_width > 0 else 0
+            norm_y = 1 - ((py - p_top) / p_height) if p_height > 0 else 0  # Flip Y
+            
+            # Clamp to [0, 1] — pixels outside plot area get clamped
+            norm_x = max(0.0, min(1.0, norm_x))
+            norm_y = max(0.0, min(1.0, norm_y))
             
             # Map to axis bounds
             axis_x = self.xMin + norm_x * (self.xMax - self.xMin)
@@ -529,9 +621,14 @@ class CurveDigitizer:
         
         width, height = image.size
         
+        # Detect actual plot area boundaries for accurate coordinate mapping
+        plot_area = self.detect_plot_area(image)
+        
         results = {
             'image_path': image_path,
             'image_dimensions': {'width': width, 'height': height},
+            'plot_area': {'left': plot_area[0], 'top': plot_area[1], 
+                         'right': plot_area[2], 'bottom': plot_area[3]},
             'axis_info': self.axis_info,
             'curves': {}
         }
@@ -557,8 +654,8 @@ class CurveDigitizer:
                     }
                     continue
                 
-                # Normalize to axis coordinates
-                axis_coords = self.normalize_to_axis(pixels, width, height)
+                # Normalize to axis coordinates using detected plot area
+                axis_coords = self.normalize_to_axis(pixels, width, height, plot_area)
                 
                 # Clean coordinates with RANSAC
                 cleaned_coords = self.clean_coordinates_ransac(axis_coords, threshold=0.05)
