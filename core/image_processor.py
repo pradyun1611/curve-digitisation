@@ -132,6 +132,123 @@ class CurveDigitizer:
         
         return r_match and g_match and b_match
     
+    def _calculate_dynamic_color_range(self, rgb_samples: List[Tuple[int, int, int]], 
+                                       margin_std: float = 2.5) -> Dict[str, int]:
+        """
+        Calculate dynamic RGB range from sampled pixels.
+        
+        Args:
+            rgb_samples: List of (r, g, b) tuples sampled from the curve
+            margin_std: Number of standard deviations to use as margin (default 1.5)
+            
+        Returns:
+            Dictionary with dynamic color range (r_min, r_max, g_min, g_max, b_min, b_max)
+        """
+        if len(rgb_samples) < 2:
+            return {}
+        
+        rgb_array = np.array(rgb_samples)
+        r_vals = rgb_array[:, 0]
+        g_vals = rgb_array[:, 1]
+        b_vals = rgb_array[:, 2]
+        
+        # Calculate mean and std for each channel
+        r_mean, r_std = np.mean(r_vals), np.std(r_vals)
+        g_mean, g_std = np.mean(g_vals), np.std(g_vals)
+        b_mean, b_std = np.mean(b_vals), np.std(b_vals)
+        
+        # Create ranges with margin
+        margin_r = max(r_std * margin_std, 5)  # Minimum margin of 5
+        margin_g = max(g_std * margin_std, 5)
+        margin_b = max(b_std * margin_std, 5)
+        
+        return {
+            'r_min': max(0, int(r_mean - margin_r)),
+            'r_max': min(255, int(r_mean + margin_r)),
+            'g_min': max(0, int(g_mean - margin_g)),
+            'g_max': min(255, int(g_mean + margin_g)),
+            'b_min': max(0, int(b_mean - margin_b)),
+            'b_max': min(255, int(b_mean + margin_b)),
+        }
+    
+    def extract_color_pixels_dynamic(self, image: Image.Image, target_color_name: str) -> List[Tuple[int, int]]:
+        """
+        Extract pixel coordinates using dynamic color range adaptation.
+        
+        Two-pass extraction:
+        1. Initial pass with hardcoded range to find approximate curve pixels
+        2. Calculate dynamic range from those samples
+        3. Final pass with dynamic range for accurate extraction
+        
+        Args:
+            image: PIL Image object
+            target_color_name: Color name (e.g., 'red', 'blue', 'green')
+            
+        Returns:
+            List of (x, y) pixel coordinates matching the color
+        """
+        img_array = np.array(image)
+        target_color = target_color_name.lower()
+        
+        # Hardcoded color ranges for initial pass
+        color_ranges = {
+            'red': {'r_min': 200, 'r_max': 255, 'g_max': 100, 'b_max': 100},
+            'blue': {'b_min': 150, 'b_max': 255, 'r_max': 50, 'g_max': 80},
+            'green': {'g_min': 200, 'g_max': 255, 'r_max': 100, 'b_max': 100},
+            'yellow': {'r_min': 200, 'g_min': 200, 'b_max': 100},
+            'orange': {'r_min': 200, 'g_min': 100, 'g_max': 200, 'b_max': 50},
+            'purple': {'r_min': 150, 'b_min': 150, 'g_max': 100},
+            'gray': {'r_min': 100, 'r_max': 200, 'g_min': 100, 'g_max': 200, 'b_min': 100, 'b_max': 200},
+            'magenta': {'r_min': 180, 'r_max': 255, 'g_max': 100, 'b_min': 180, 'b_max': 255},
+            'pink': {'r_min': 200, 'r_max': 255, 'g_max': 150, 'b_min': 150, 'b_max': 255},
+            'light blue': {'r_min': 130, 'r_max': 180, 'g_min': 130, 'g_max': 180, 'b_min': 235, 'b_max': 255},
+            'cyan': {'r_max': 100, 'g_min': 180, 'g_max': 255, 'b_min': 200, 'b_max': 255},
+            'light green': {'r_min': 100, 'r_max': 200, 'g_min': 200, 'g_max': 255, 'b_max': 150},
+            'dark blue': {'r_max': 50, 'g_max': 50, 'b_min': 150, 'b_max': 255},
+            'dark red': {'r_min': 139, 'r_max': 200, 'g_max': 50, 'b_max': 50},
+            'brown': {'r_min': 120, 'r_max': 200, 'g_min': 50, 'g_max': 120, 'b_max': 80},
+            'teal': {'r_max': 80, 'g_min': 128, 'g_max': 200, 'b_min': 128, 'b_max': 200},
+        }
+        
+        if target_color not in color_ranges:
+            # Unknown color: fallback to non-white extraction
+            return self._extract_non_white_pixels(img_array)
+        
+        # ─── PASS 1: Initial extraction with hardcoded range ───
+        initial_range = color_ranges[target_color]
+        initial_pixels = []
+        height, width = img_array.shape[:2]
+        
+        for y in range(height):
+            for x in range(width):
+                r, g, b = img_array[y, x, :3]
+                if self._pixel_matches_color(r, g, b, initial_range):
+                    initial_pixels.append((x, y))
+        
+        # If we don't have enough initial samples, return what we have
+        if len(initial_pixels) < 10:
+            return initial_pixels
+        
+        # ─── Extract RGB samples from initial pixels ───
+        rgb_samples = [tuple(img_array[y, x, :3]) for x, y in initial_pixels]
+        
+        # ─── Calculate dynamic range from samples ───
+        dynamic_range = self._calculate_dynamic_color_range(rgb_samples)
+        
+        if not dynamic_range:
+            # If dynamic calculation failed, return initial extraction
+            return initial_pixels
+        
+        # ─── PASS 2: Final extraction with dynamic range ───
+        final_pixels = []
+        for y in range(height):
+            for x in range(width):
+                r, g, b = img_array[y, x, :3]
+                if self._pixel_matches_color(r, g, b, dynamic_range):
+                    final_pixels.append((x, y))
+        
+        return final_pixels if final_pixels else initial_pixels
+    
     def _extract_non_white_pixels(self, img_array: np.ndarray) -> List[Tuple[int, int]]:
         """Extract non-white, non-background pixels."""
         pixels = []
@@ -429,8 +546,8 @@ class CurveDigitizer:
                 if color.lower() == 'black':
                     continue
                 
-                # Extract pixels
-                pixels = self.extract_color_pixels(image, color)
+                # Extract pixels using dynamic RGB range adaptation
+                pixels = self.extract_color_pixels_dynamic(image, color)
                 
                 if len(pixels) < 2:
                     results['curves'][color] = {
