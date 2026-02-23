@@ -78,7 +78,7 @@ class CurveDigitizer:
         # Convert to RGB numpy array
         img_array = np.array(image)
         
-        # Define color ranges (HSV-like approximation in RGB)
+        # Define color ranges (RGB thresholds)
         color_ranges = {
             'red': {'r_min': 200, 'r_max': 255, 'g_max': 100, 'b_max': 100},
             'blue': {'b_min': 200, 'b_max': 255, 'r_max': 100, 'g_max': 150},
@@ -88,6 +88,15 @@ class CurveDigitizer:
             'purple': {'r_min': 150, 'b_min': 150, 'g_max': 100},
             'black': {'r_max': 50, 'g_max': 50, 'b_max': 50},
             'gray': {'r_min': 100, 'r_max': 200, 'g_min': 100, 'g_max': 200, 'b_min': 100, 'b_max': 200},
+            'magenta': {'r_min': 180, 'r_max': 255, 'g_max': 100, 'b_min': 180, 'b_max': 255},
+            'pink': {'r_min': 200, 'r_max': 255, 'g_max': 150, 'b_min': 150, 'b_max': 255},
+            'light blue': {'r_max': 150, 'g_min': 150, 'g_max': 255, 'b_min': 200, 'b_max': 255},
+            'cyan': {'r_max': 100, 'g_min': 180, 'g_max': 255, 'b_min': 200, 'b_max': 255},
+            'light green': {'r_min': 100, 'r_max': 200, 'g_min': 200, 'g_max': 255, 'b_max': 150},
+            'dark blue': {'r_max': 50, 'g_max': 50, 'b_min': 150, 'b_max': 255},
+            'dark red': {'r_min': 139, 'r_max': 200, 'g_max': 50, 'b_max': 50},
+            'brown': {'r_min': 120, 'r_max': 200, 'g_min': 50, 'g_max': 120, 'b_max': 80},
+            'teal': {'r_max': 80, 'g_min': 128, 'g_max': 200, 'b_min': 128, 'b_max': 200},
         }
         
         target_color = target_color_name.lower()
