@@ -40,6 +40,34 @@ def display_image_results(results: Dict[str, Any]) -> None:
         st.write(f"**Width:** {dims.get('width', 'N/A')} px")
         st.write(f"**Height:** {dims.get('height', 'N/A')} px")
     
+    # ── Overall Graph Metrics ──
+    overall = results.get('overall_metrics', {})
+    if overall and overall.get('delta_value') is not None:
+        st.subheader("📐 Overall Graph Quality Metrics")
+        st.caption(f"Averaged across {overall.get('curve_count', 0)} curve(s)")
+        
+        o1, o2, o3 = st.columns(3)
+        with o1:
+            st.metric("Delta Value", f"{overall['delta_value']:.4f}",
+                      help="Mean absolute error averaged across all curves (in axis units)")
+        with o2:
+            st.metric("Delta Norm", f"{overall['delta_norm']:.4%}",
+                      help="Normalized error averaged across all curves (lower is better)")
+        with o3:
+            st.metric("Delta P95", f"{overall['delta_p95']:.4f}",
+                      help="Worst 95th-percentile error across all curves")
+        
+        o4, o5, o6 = st.columns(3)
+        with o4:
+            st.metric("IoU", f"{overall['iou']:.4f}",
+                      help="Average Intersection over Union across all curves (1.0 = perfect)")
+        with o5:
+            st.metric("Precision", f"{overall['precision']:.4f}",
+                      help="Average precision across all curves")
+        with o6:
+            st.metric("Recall", f"{overall['recall']:.4f}",
+                      help="Average recall across all curves")
+    
     st.subheader("🎨 Detected Curves")
     
     curves = results.get('curves', {})
@@ -82,6 +110,34 @@ def display_image_results(results: Dict[str, Any]) -> None:
                     
                     if fit.get('error'):
                         st.error(f"**Error:** {fit['error']}")
+                
+                # ── Quality Metrics ──
+                metrics = curve_data.get('metrics', {})
+                if metrics and metrics.get('delta_value') is not None:
+                    st.write("---")
+                    st.write("**📐 Quality Metrics**")
+                    
+                    m1, m2, m3 = st.columns(3)
+                    with m1:
+                        st.metric("Delta Value", f"{metrics['delta_value']:.4f}",
+                                  help="Mean absolute error between extracted data points and fitted curve (in axis units)")
+                    with m2:
+                        st.metric("Delta Norm", f"{metrics['delta_norm']:.4%}",
+                                  help="Delta normalized by Y-axis range — scale-independent error (lower is better)")
+                    with m3:
+                        st.metric("Delta P95", f"{metrics['delta_p95']:.4f}",
+                                  help="95th percentile of absolute errors — worst-case error excluding outliers")
+                    
+                    m4, m5, m6 = st.columns(3)
+                    with m4:
+                        st.metric("IoU", f"{metrics['iou']:.4f}",
+                                  help="Intersection over Union — overlap between fitted curve and actual data bands (1.0 = perfect)")
+                    with m5:
+                        st.metric("Precision", f"{metrics['precision']:.4f}",
+                                  help="Fraction of fitted curve regions that have actual data nearby (1.0 = no hallucinated curve segments)")
+                    with m6:
+                        st.metric("Recall", f"{metrics['recall']:.4f}",
+                                  help="Fraction of actual data regions captured by the fitted curve (1.0 = no data missed)")
     else:
         st.warning("No curves detected in the image.")
     

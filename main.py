@@ -101,6 +101,35 @@ def process_image_task(openai_client: OpenAIClient, image_path: str, user_query:
             label = curve.get('label', 'unlabeled')
             response += f"- {color.capitalize()}: {label}\n"
         
+        # Overall graph-level metrics
+        overall = results.get('overall_metrics', {})
+        if overall and overall.get('delta_value') is not None:
+            response += f"\n**Overall Graph Quality** (averaged across {overall.get('curve_count', 0)} curves):\n"
+            response += f"  - Delta Value: {overall['delta_value']:.4f}\n"
+            response += f"  - Delta Norm:  {overall['delta_norm']:.4%}\n"
+            response += f"  - Delta P95:   {overall['delta_p95']:.4f}\n"
+            response += f"  - IoU:         {overall['iou']:.4f}\n"
+            response += f"  - Precision:   {overall['precision']:.4f}\n"
+            response += f"  - Recall:      {overall['recall']:.4f}\n"
+        
+        # Quality metrics per curve
+        curves_data = results.get('curves', {})
+        has_metrics = False
+        for cname, cdata in curves_data.items():
+            m = cdata.get('metrics', {})
+            if m and m.get('delta_value') is not None:
+                if not has_metrics:
+                    response += f"\n**Quality Metrics:**\n"
+                    has_metrics = True
+                label = cdata.get('label', cname)
+                response += f"\n  __{label}__\n"
+                response += f"  - Delta Value: {m['delta_value']:.4f}  (mean abs error in axis units)\n"
+                response += f"  - Delta Norm:  {m['delta_norm']:.4%}  (normalized by Y range)\n"
+                response += f"  - Delta P95:   {m['delta_p95']:.4f}  (95th percentile error)\n"
+                response += f"  - IoU:         {m['iou']:.4f}  (overlap: 1.0 = perfect)\n"
+                response += f"  - Precision:   {m['precision']:.4f}  (fitted curve quality)\n"
+                response += f"  - Recall:      {m['recall']:.4f}  (data capture rate)\n"
+        
         response += f"\n**Results saved to:** {output_file}\n"
         
         # List generated graphs

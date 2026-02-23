@@ -506,6 +506,115 @@ class CurveDigitizer:
                 'error': str(e)
             }
     
+    def calculate_curve_metrics(self, cleaned_coords: List[Tuple[float, float]],
+                                fit_result: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Calculate quality metrics comparing original extracted points to the fitted curve.
+        
+        Metrics:
+        - delta_value: Mean absolute error between extracted points and fitted curve
+        - delta_norm: Delta normalized by axis Y-range (scale-independent, 0-1)
+        - iou: Intersection over Union of point bands (fitted vs extracted)
+        - precision: Fraction of fitted curve region covered by actual data
+        - recall: Fraction of actual data captured by the fitted curve region
+        - delta_p95: 95th percentile of absolute errors (worst-case excluding outliers)
+        
+        Args:
+            cleaned_coords: Cleaned (x, y) coordinate tuples from pixel extraction
+            fit_result: Dictionary from fit_polynomial_curve with coefficients etc.
+            
+        Returns:
+            Dictionary of metric names to values
+        """
+        metrics = {
+            'delta_value': None,
+            'delta_norm': None,
+            'iou': None,
+            'precision': None,
+            'recall': None,
+            'delta_p95': None,
+        }
+        
+        coeffs = fit_result.get('coefficients')
+        if coeffs is None or len(cleaned_coords) < 3:
+            return metrics
+        
+        coords_array = np.array(cleaned_coords)
+        x_actual = coords_array[:, 0]
+        y_actual = coords_array[:, 1]
+        
+        # Evaluate fitted polynomial at actual x positions
+        poly = np.poly1d(coeffs)
+        y_fitted = poly(x_actual)
+        
+        # ─── Delta Value (Mean Absolute Error) ───
+        absolute_errors = np.abs(y_actual - y_fitted)
+        delta_value = float(np.mean(absolute_errors))
+        
+        # ─── Delta Norm (Normalized MAE) ───
+        y_range = self.yMax - self.yMin
+        delta_norm = float(delta_value / y_range) if y_range > 0 else 0.0
+        
+        # ─── Delta P95 (95th percentile error) ───
+        delta_p95 = float(np.percentile(absolute_errors, 95))
+        
+        # ─── IoU, Precision, Recall ───
+        # Compare by binning x-values and checking y-overlap in each bin
+        n_bins = 50
+        x_min, x_max = float(np.min(x_actual)), float(np.max(x_actual))
+        if x_max <= x_min:
+            x_max = x_min + 1e-6
+        
+        bin_edges = np.linspace(x_min, x_max, n_bins + 1)
+        
+        # Band tolerance: how close y values need to be to count as "overlapping"
+        band_tolerance = y_range * 0.02  # 2% of axis range
+        
+        intersection_count = 0
+        actual_bins_occupied = 0
+        fitted_bins_occupied = 0
+        
+        for i in range(n_bins):
+            b_lo, b_hi = bin_edges[i], bin_edges[i + 1]
+            
+            # Actual points in this bin
+            mask = (x_actual >= b_lo) & (x_actual < b_hi)
+            actual_in_bin = y_actual[mask]
+            
+            # Fitted value at bin center
+            x_center = (b_lo + b_hi) / 2.0
+            y_fit_val = poly(x_center)
+            
+            has_actual = len(actual_in_bin) > 0
+            has_fitted = True  # polynomial is defined everywhere
+            
+            if has_actual:
+                actual_bins_occupied += 1
+            if has_fitted:
+                fitted_bins_occupied += 1
+            
+            # Check overlap: any actual point within tolerance of fitted value
+            if has_actual and has_fitted:
+                if np.any(np.abs(actual_in_bin - y_fit_val) <= band_tolerance):
+                    intersection_count += 1
+        
+        union_count = actual_bins_occupied + fitted_bins_occupied - intersection_count
+        
+        iou = float(intersection_count / union_count) if union_count > 0 else 0.0
+        precision = float(intersection_count / fitted_bins_occupied) if fitted_bins_occupied > 0 else 0.0
+        recall = float(intersection_count / actual_bins_occupied) if actual_bins_occupied > 0 else 0.0
+        
+        metrics = {
+            'delta_value': round(delta_value, 4),
+            'delta_norm': round(delta_norm, 6),
+            'iou': round(iou, 4),
+            'precision': round(precision, 4),
+            'recall': round(recall, 4),
+            'delta_p95': round(delta_p95, 4),
+        }
+        
+        return metrics
+    
     def _poly_equation_string(self, coeffs: np.ndarray) -> str:
         """Generate human-readable polynomial equation string."""
         degree = len(coeffs) - 1
@@ -663,14 +772,34 @@ class CurveDigitizer:
                 # Fit polynomial curve
                 fit_result = self.fit_polynomial_curve(cleaned_coords, degree=2)
                 
+                # Calculate quality metrics
+                metrics = self.calculate_curve_metrics(cleaned_coords, fit_result)
+                
                 results['curves'][color] = {
                     'label': label,
                     'color': color,
                     'original_point_count': len(pixels),
                     'normalized_point_count': len(axis_coords),
                     'cleaned_point_count': len(cleaned_coords),
-                    'fit_result': fit_result
+                    'fit_result': fit_result,
+                    'metrics': metrics
                 }
+        
+        # Compute aggregate (graph-level) metrics across all curves
+        all_metrics = [c.get('metrics', {}) for c in results['curves'].values()
+                       if c.get('metrics', {}).get('delta_value') is not None]
+        if all_metrics:
+            results['overall_metrics'] = {
+                'delta_value': round(float(np.mean([m['delta_value'] for m in all_metrics])), 4),
+                'delta_norm': round(float(np.mean([m['delta_norm'] for m in all_metrics])), 6),
+                'iou': round(float(np.mean([m['iou'] for m in all_metrics])), 4),
+                'precision': round(float(np.mean([m['precision'] for m in all_metrics])), 4),
+                'recall': round(float(np.mean([m['recall'] for m in all_metrics])), 4),
+                'delta_p95': round(float(np.max([m['delta_p95'] for m in all_metrics])), 4),
+                'curve_count': len(all_metrics),
+            }
+        else:
+            results['overall_metrics'] = {}
         
         # Create per-instance output folder
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
