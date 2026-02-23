@@ -119,7 +119,7 @@ def get_general_response(openai_client: OpenAIClient, user_query: str) -> str:
         user_query: User's query
         
     Returns:
-        OpenAI's response
+        OpenAI response
     """
     try:
         response = openai_client.get_general_response(user_query)
