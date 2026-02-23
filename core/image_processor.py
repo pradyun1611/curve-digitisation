@@ -133,7 +133,7 @@ class CurveDigitizer:
         return r_match and g_match and b_match
     
     def _calculate_dynamic_color_range(self, rgb_samples: List[Tuple[int, int, int]], 
-                                       margin_std: float = 1.5) -> Dict[str, int]:
+                                       margin_std: float = 1.0) -> Dict[str, int]:
         """
         Calculate dynamic RGB range from sampled pixels.
         
