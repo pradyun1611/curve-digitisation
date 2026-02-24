@@ -154,7 +154,7 @@ def process_image(client: OpenAIClient, image_file, user_query: str, output_dir:
         
     except Exception as e:
         st.error(f"Error processing image: {e}")
-        return None
+        return {'_error': str(e)}
 
 
 def main():
@@ -226,7 +226,7 @@ def main():
             # Process image
             results = process_image(client, uploaded_file, user_input, output_dir)
             
-            if results:
+            if results and '_error' not in results:
                 # Update chat with summary
                 axis_info = results.get('axis_info', {})
                 features_summary = {
@@ -241,9 +241,10 @@ def main():
                 
                 st.session_state.results_history.append(results)
             else:
+                err_msg = results.get('_error', 'Unknown error') if results else 'Unknown error'
                 st.session_state.chat_history.append({
                     'role': 'bot',
-                    'content': '❌ Failed to process image. Please check the image format and try again.'
+                    'content': f'❌ Failed to process image: {err_msg}'
                 })
         else:
             # No file uploaded – check intent to give helpful guidance

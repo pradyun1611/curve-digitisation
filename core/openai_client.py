@@ -31,7 +31,7 @@ def _make_azure_client(api_key: str, api_version: str, endpoint: str) -> AzureOp
     """Create an AzureOpenAI client with a resilient httpx transport."""
     try:
         import httpx
-        http_client = httpx.Client(timeout=httpx.Timeout(120.0, connect=30.0))
+        http_client = httpx.Client(timeout=httpx.Timeout(300.0, connect=60.0))
         return AzureOpenAI(
             api_key=api_key,
             api_version=api_version,

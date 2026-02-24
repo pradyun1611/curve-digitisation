@@ -111,18 +111,9 @@ class CurveDigitizer:
         
         color_range = color_ranges[target_color]
         
-        # Extract pixels matching color range
-        pixels = []
-        height, width = img_array.shape[:2]
-        
-        for y in range(height):
-            for x in range(width):
-                r, g, b = img_array[y, x, :3]
-                
-                if self._pixel_matches_color(r, g, b, color_range):
-                    pixels.append((x, y))
-        
-        return pixels
+        # Extract pixels matching color range (vectorized)
+        mask = self._vectorized_color_mask(img_array, color_range)
+        return self._mask_to_coords(mask)
     
     def _pixel_matches_color(self, r: int, g: int, b: int, color_range: Dict) -> bool:
         """Check if RGB values match color range."""
@@ -131,6 +122,34 @@ class CurveDigitizer:
         b_match = (color_range.get('b_min', 0) <= b <= color_range.get('b_max', 255))
         
         return r_match and g_match and b_match
+    
+    def _vectorized_color_mask(self, img_array: np.ndarray, color_range: Dict) -> np.ndarray:
+        """
+        Build a boolean mask for all pixels matching a colour range (vectorized).
+        
+        Args:
+            img_array: numpy array of shape (H, W, 3+)
+            color_range: Dict with r_min/r_max/g_min/g_max/b_min/b_max keys
+            
+        Returns:
+            Boolean mask of shape (H, W)
+        """
+        r = img_array[:, :, 0].astype(np.int16)
+        g = img_array[:, :, 1].astype(np.int16)
+        b = img_array[:, :, 2].astype(np.int16)
+        
+        mask = (
+            (r >= color_range.get('r_min', 0)) & (r <= color_range.get('r_max', 255)) &
+            (g >= color_range.get('g_min', 0)) & (g <= color_range.get('g_max', 255)) &
+            (b >= color_range.get('b_min', 0)) & (b <= color_range.get('b_max', 255))
+        )
+        return mask
+    
+    @staticmethod
+    def _mask_to_coords(mask: np.ndarray) -> List[Tuple[int, int]]:
+        """Convert a 2-D boolean mask to a list of (x, y) pixel coordinates."""
+        ys, xs = np.where(mask)
+        return list(zip(xs.tolist(), ys.tolist()))
     
     def _calculate_dynamic_color_range(self, rgb_samples: List[Tuple[int, int, int]], 
                                        margin_std: float = 1.0) -> Dict[str, int]:
@@ -214,16 +233,10 @@ class CurveDigitizer:
             # Unknown color: fallback to non-white extraction
             return self._extract_non_white_pixels(img_array)
         
-        # ─── PASS 1: Initial extraction with hardcoded range ───
+        # ─── PASS 1: Initial extraction with hardcoded range (vectorized) ───
         initial_range = color_ranges[target_color]
-        initial_pixels = []
-        height, width = img_array.shape[:2]
-        
-        for y in range(height):
-            for x in range(width):
-                r, g, b = img_array[y, x, :3]
-                if self._pixel_matches_color(r, g, b, initial_range):
-                    initial_pixels.append((x, y))
+        initial_mask = self._vectorized_color_mask(img_array, initial_range)
+        initial_pixels = self._mask_to_coords(initial_mask)
         
         # If we don't have enough initial samples, return what we have
         if len(initial_pixels) < 10:
@@ -239,30 +252,17 @@ class CurveDigitizer:
             # If dynamic calculation failed, return initial extraction
             return initial_pixels
         
-        # ─── PASS 2: Final extraction with dynamic range ───
-        final_pixels = []
-        for y in range(height):
-            for x in range(width):
-                r, g, b = img_array[y, x, :3]
-                if self._pixel_matches_color(r, g, b, dynamic_range):
-                    final_pixels.append((x, y))
+        # ─── PASS 2: Final extraction with dynamic range (vectorized) ───
+        final_mask = self._vectorized_color_mask(img_array, dynamic_range)
+        final_pixels = self._mask_to_coords(final_mask)
         
         return final_pixels if final_pixels else initial_pixels
     
     def _extract_non_white_pixels(self, img_array: np.ndarray) -> List[Tuple[int, int]]:
-        """Extract non-white, non-background pixels."""
-        pixels = []
-        height, width = img_array.shape[:2]
-        
-        for y in range(height):
-            for x in range(width):
-                r, g, b = img_array[y, x, :3]
-                # Exclude white, light gray, and very light pixels
-                brightness = (r + g + b) / 3
-                if brightness < 240:
-                    pixels.append((x, y))
-        
-        return pixels
+        """Extract non-white, non-background pixels (vectorized)."""
+        brightness = np.mean(img_array[:, :, :3].astype(np.float32), axis=2)
+        mask = brightness < 240
+        return self._mask_to_coords(mask)
     
     def filter_spatially_connected(self, pixels: List[Tuple[int, int]],
                                     image_width: int, image_height: int
@@ -737,7 +737,15 @@ class CurveDigitizer:
 
         try:
             from scipy.interpolate import UnivariateSpline
-            s_val = smoothing if smoothing > 0 else len(ux) * 0.02
+            # Smoothing factor: higher = smoother curve.
+            # s ~ N means the spline is allowed total squared-error ≈ s.
+            # Using N * var(y) * 0.05 gives a clean, smooth curve while
+            # still following the data trend accurately.
+            if smoothing > 0:
+                s_val = smoothing
+            else:
+                y_var = float(np.var(uy)) if np.var(uy) > 1e-12 else 1.0
+                s_val = len(ux) * y_var * 0.05
             k = min(3, len(ux) - 1)
             spl = UnivariateSpline(ux, uy, k=k, s=s_val)
 
