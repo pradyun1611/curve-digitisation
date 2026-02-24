@@ -264,6 +264,56 @@ class CurveDigitizer:
         
         return pixels
     
+    def filter_spatially_connected(self, pixels: List[Tuple[int, int]],
+                                    image_width: int, image_height: int
+                                    ) -> List[Tuple[int, int]]:
+        """
+        Keep only the largest spatially connected band of pixels.
+        
+        Paints extracted pixels onto a binary mask, runs connected-component
+        labelling, and returns only the pixels belonging to the largest
+        component.  This strips isolated blobs caused by colour overlap
+        between adjacent curves (e.g. dark-blue pixels leaking into purple).
+        
+        Uses 8-connectivity so diagonally adjacent pixels count as connected.
+        
+        Args:
+            pixels: List of (x, y) pixel coordinates
+            image_width: Full image width
+            image_height: Full image height
+            
+        Returns:
+            Filtered list of (x, y) pixel coordinates
+        """
+        if len(pixels) < 10:
+            return pixels
+        
+        from scipy.ndimage import label as ndimage_label
+        
+        # Paint pixels onto a binary mask
+        mask = np.zeros((image_height, image_width), dtype=np.uint8)
+        for x, y in pixels:
+            if 0 <= y < image_height and 0 <= x < image_width:
+                mask[y, x] = 1
+        
+        # 8-connectivity kernel
+        structure = np.ones((3, 3), dtype=int)
+        labelled, n_components = ndimage_label(mask, structure=structure)
+        
+        if n_components <= 1:
+            return pixels
+        
+        # Find the largest component
+        component_sizes = np.bincount(labelled.ravel())
+        component_sizes[0] = 0  # ignore background
+        largest_label = int(np.argmax(component_sizes))
+        
+        # Keep only pixels in the largest component
+        filtered = [(x, y) for x, y in pixels
+                    if labelled[y, x] == largest_label]
+        
+        return filtered if len(filtered) >= 5 else pixels
+    
     # ─────────────────────────────────────────────────────────────
     #  Grayscale / B&W image support
     # ─────────────────────────────────────────────────────────────
@@ -983,7 +1033,6 @@ class CurveDigitizer:
         if has_valid_curves:
             ax.set_xlabel(x_label, fontsize=12)
             ax.set_ylabel(y_label, fontsize=12)
-            ax.set_title(f"Digitized Curves — {description}", fontsize=14, fontweight='bold')
             ax.legend(loc='best', fontsize=9, framealpha=0.9)
             ax.grid(True, alpha=0.3, linestyle='--')
             ax.set_xlim(self.xMin, self.xMax)
@@ -1100,6 +1149,10 @@ class CurveDigitizer:
                 if color.lower() in _DARK_NAMES and has_colored_series:
                     continue
                 
+                # Skip surge line — it's a reference boundary, not a performance curve
+                if 'surge' in label.lower():
+                    continue
+                
                 # Extract pixels using dynamic RGB range adaptation
                 pixels = self.extract_color_pixels_dynamic(image, color)
                 
@@ -1107,6 +1160,10 @@ class CurveDigitizer:
                 p_left, p_top, p_right, p_bottom = plot_area
                 pixels = [(x, y) for x, y in pixels
                           if p_left <= x <= p_right and p_top <= y <= p_bottom]
+                
+                # Spatial continuity filter: keep only the largest connected
+                # blob to remove stray pixels from adjacent-colour curves
+                pixels = self.filter_spatially_connected(pixels, width, height)
                 
                 if len(pixels) < 2:
                     results['curves'][color] = {
