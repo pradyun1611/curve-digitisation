@@ -26,7 +26,7 @@ class MappingResult:
     # Inverse 2x3: [px, py] = M_inv @ [data_x, data_y, 1]
     data_to_pixel_matrix: List[List[float]] = field(default_factory=list)
 
-    frame: str = "plot_area"       # always "plot_area"
+    frame: str = "plot_area"       # always "Plot_area"
     x_direction: int = 1           # +1 = x increases rightward
     y_direction: int = 1           # +1 = y increases upward (data)
 
