@@ -264,6 +264,56 @@ class CurveDigitizer:
         
         return pixels
     
+    def filter_spatially_connected(self, pixels: List[Tuple[int, int]],
+                                    image_width: int, image_height: int
+                                    ) -> List[Tuple[int, int]]:
+        """
+        Keep only the largest spatially connected band of pixels.
+        
+        Paints extracted pixels onto a binary mask, runs connected-component
+        labelling, and returns only the pixels belonging to the largest
+        component.  This strips isolated blobs caused by colour overlap
+        between adjacent curves (e.g. dark-blue pixels leaking into purple).
+        
+        Uses 8-connectivity so diagonally adjacent pixels count as connected.
+        
+        Args:
+            pixels: List of (x, y) pixel coordinates
+            image_width: Full image width
+            image_height: Full image height
+            
+        Returns:
+            Filtered list of (x, y) pixel coordinates
+        """
+        if len(pixels) < 10:
+            return pixels
+        
+        from scipy.ndimage import label as ndimage_label
+        
+        # Paint pixels onto a binary mask
+        mask = np.zeros((image_height, image_width), dtype=np.uint8)
+        for x, y in pixels:
+            if 0 <= y < image_height and 0 <= x < image_width:
+                mask[y, x] = 1
+        
+        # 8-connectivity kernel
+        structure = np.ones((3, 3), dtype=int)
+        labelled, n_components = ndimage_label(mask, structure=structure)
+        
+        if n_components <= 1:
+            return pixels
+        
+        # Find the largest component
+        component_sizes = np.bincount(labelled.ravel())
+        component_sizes[0] = 0  # ignore background
+        largest_label = int(np.argmax(component_sizes))
+        
+        # Keep only pixels in the largest component
+        filtered = [(x, y) for x, y in pixels
+                    if labelled[y, x] == largest_label]
+        
+        return filtered if len(filtered) >= 5 else pixels
+    
     # ─────────────────────────────────────────────────────────────
     #  Grayscale / B&W image support
     # ─────────────────────────────────────────────────────────────
@@ -902,6 +952,9 @@ class CurveDigitizer:
                 # Skip if colour is black AND label overlaps an axis word
                 if clr == 'black' and any(w in lbl for w in axis_words):
                     continue
+                # Skip surge line — reference boundary, not a performance curve
+                if 'surge' in lbl:
+                    continue
                 curve_features.append(cf)
             
             num_curves = len(curve_features)
@@ -949,8 +1002,16 @@ class CurveDigitizer:
                 if color.lower() == 'black':
                     continue
                 
+                # Skip surge line — it's a reference boundary, not a performance curve
+                if 'surge' in label.lower():
+                    continue
+                
                 # Extract pixels using dynamic RGB range adaptation
                 pixels = self.extract_color_pixels_dynamic(image, color)
+                
+                # Spatial continuity filter: keep only the largest connected
+                # blob to remove stray pixels from adjacent-colour curves
+                pixels = self.filter_spatially_connected(pixels, width, height)
                 
                 if len(pixels) < 2:
                     results['curves'][color] = {
@@ -964,7 +1025,7 @@ class CurveDigitizer:
                 axis_coords = self.normalize_to_axis(pixels, width, height, plot_area)
                 
                 # Clean coordinates with RANSAC
-                cleaned_coords = self.clean_coordinates_ransac(axis_coords, threshold=0.05)
+                cleaned_coords = self.clean_coordinates_ransac(axis_coords, threshold=0.005)
                 
                 # Fit polynomial curve
                 fit_result = self.fit_polynomial_curve(cleaned_coords, degree=2)
