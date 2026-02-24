@@ -442,6 +442,25 @@ class CurveDigitizer:
         min_dark_v = int(height * line_ratio)
         vertical_line_cols = np.where(dark_per_col >= min_dark_v)[0]
         
+        # ─── Reject dashed / reference lines ───
+        # Solid axis lines have a high fill-ratio within their span;
+        # dashed lines (surge, reference) have alternating dark/gap segments.
+        def _is_solid(dark_1d: np.ndarray) -> bool:
+            idx = np.where(dark_1d)[0]
+            if len(idx) < 5:
+                return False
+            span = idx[-1] - idx[0] + 1
+            return len(idx) / span > 0.70   # >70% filled = solid
+        
+        vertical_line_cols = np.array(
+            [c for c in vertical_line_cols if _is_solid(dark_mask[:, c])],
+            dtype=int,
+        )
+        horizontal_line_rows = np.array(
+            [r for r in horizontal_line_rows if _is_solid(dark_mask[r, :])],
+            dtype=int,
+        )
+        
         # ─── Determine plot boundaries ───
         # Default: use 10% margins as fallback
         plot_left = int(width * 0.10)
@@ -589,7 +608,117 @@ class CurveDigitizer:
         except Exception:
             # If fitting fails, return all points
             return np.ones(len(y), dtype=bool)
-    
+
+    # ─────────────────────────────────────────────────────────────
+    #  Local deviation cleaner  (shape-preserving)
+    # ─────────────────────────────────────────────────────────────
+
+    def clean_coordinates_local(self, coordinates: List[Tuple[float, float]],
+                                window: int = 7,
+                                sigma: float = 2.5) -> List[Tuple[float, float]]:
+        """Remove outlier points using a local moving-window deviation filter.
+
+        Unlike ``clean_coordinates_ransac`` (which fits a single global
+        polynomial), this method evaluates each point against its local
+        neighbourhood.  This preserves curves with multiple inflection
+        points, S-shapes, or other non-polynomial forms.
+        """
+        if len(coordinates) < window:
+            return coordinates
+
+        arr = np.array(sorted(coordinates, key=lambda p: p[0]))
+        xs, ys = arr[:, 0], arr[:, 1]
+        n = len(ys)
+        keep = np.ones(n, dtype=bool)
+        half = window // 2
+
+        for i in range(n):
+            lo = max(0, i - half)
+            hi = min(n, i + half + 1)
+            local_y = ys[lo:hi]
+            med = np.median(local_y)
+            mad = np.median(np.abs(local_y - med))
+            if mad < 1e-9:
+                mad = np.std(local_y)
+            if mad < 1e-9:
+                continue
+            if abs(ys[i] - med) > sigma * mad:
+                keep[i] = False
+
+        cleaned = arr[keep]
+        if len(cleaned) < len(arr) * 0.6:
+            return coordinates
+        return [tuple(p) for p in cleaned]
+
+    # ─────────────────────────────────────────────────────────────
+    #  Cubic smoothing spline  (any curve shape)
+    # ─────────────────────────────────────────────────────────────
+
+    def fit_spline_curve(self, coordinates: List[Tuple[float, float]],
+                         n_output: int = 300,
+                         smoothing: float = 0.0) -> Dict[str, Any]:
+        """Fit a cubic smoothing spline to coordinate data.
+
+        Unlike ``fit_polynomial_curve`` this can represent **any** curve
+        shape (S-curves, multiple peaks, steep drops, etc.).
+        """
+        if len(coordinates) < 4:
+            return {
+                'degree': 'spline',
+                'coefficients': None,
+                'error': f'Not enough points ({len(coordinates)}) for spline fit'
+            }
+
+        arr = np.array(sorted(coordinates, key=lambda p: p[0]))
+        xs, ys = arr[:, 0], arr[:, 1]
+
+        # Remove duplicate x values (average y)
+        ux, idx_inv = np.unique(xs, return_inverse=True)
+        uy = np.zeros_like(ux)
+        for i in range(len(ux)):
+            uy[i] = np.mean(ys[idx_inv == i])
+
+        if len(ux) < 4:
+            return {
+                'degree': 'spline',
+                'coefficients': None,
+                'error': 'Too few unique x values for spline'
+            }
+
+        try:
+            from scipy.interpolate import UnivariateSpline
+            s_val = smoothing if smoothing > 0 else len(ux) * 0.02
+            k = min(3, len(ux) - 1)
+            spl = UnivariateSpline(ux, uy, k=k, s=s_val)
+
+            x_fit = np.linspace(float(ux[0]), float(ux[-1]), n_output)
+            y_fit = spl(x_fit)
+
+            y_pred = spl(ux)
+            ss_res = float(np.sum((uy - y_pred) ** 2))
+            ss_tot = float(np.sum((uy - np.mean(uy)) ** 2))
+            r_squared = 1 - (ss_res / ss_tot) if ss_tot > 1e-12 else 1.0
+
+            return {
+                'degree': 'spline',
+                'coefficients': None,
+                'r_squared': float(r_squared),
+                'fitted_points': [{'x': float(x), 'y': float(y)}
+                                  for x, y in zip(x_fit, y_fit)],
+                'original_point_count': len(coordinates),
+                'equation': 'cubic smoothing spline'
+            }
+        except Exception as e:
+            return {
+                'degree': 'spline',
+                'coefficients': None,
+                'r_squared': None,
+                'fitted_points': [{'x': float(x), 'y': float(y)}
+                                  for x, y in zip(ux, uy)],
+                'original_point_count': len(coordinates),
+                'equation': f'spline fallback ({e})'
+            }
+
     def fit_polynomial_curve(self, coordinates: List[Tuple[float, float]], 
                             degree: int = 2) -> Dict[str, Any]:
         """
@@ -673,17 +802,27 @@ class CurveDigitizer:
             'delta_p95': None,
         }
         
-        coeffs = fit_result.get('coefficients')
-        if coeffs is None or len(cleaned_coords) < 3:
+        if len(cleaned_coords) < 3:
             return metrics
-        
+
+        coeffs = fit_result.get('coefficients')
+        fitted_pts = fit_result.get('fitted_points', [])
+
         coords_array = np.array(cleaned_coords)
         x_actual = coords_array[:, 0]
         y_actual = coords_array[:, 1]
-        
-        # Evaluate fitted polynomial at actual x positions
-        poly = np.poly1d(coeffs)
-        y_fitted = poly(x_actual)
+
+        # Build an interpolator from fitted_points (works for BOTH
+        # polynomial and spline results).
+        if fitted_pts and len(fitted_pts) >= 2:
+            fp_x = np.array([p['x'] for p in fitted_pts])
+            fp_y = np.array([p['y'] for p in fitted_pts])
+            y_fitted = np.interp(x_actual, fp_x, fp_y)
+        elif coeffs is not None:
+            poly = np.poly1d(coeffs)
+            y_fitted = poly(x_actual)
+        else:
+            return metrics
         
         # ─── Delta Value (Mean Absolute Error) ───
         absolute_errors = np.abs(y_actual - y_fitted)
@@ -719,9 +858,12 @@ class CurveDigitizer:
             mask = (x_actual >= b_lo) & (x_actual < b_hi)
             actual_in_bin = y_actual[mask]
             
-            # Fitted value at bin center
+            # Fitted value at bin center (works for any fit type)
             x_center = (b_lo + b_hi) / 2.0
-            y_fit_val = poly(x_center)
+            if fitted_pts and len(fitted_pts) >= 2:
+                y_fit_val = float(np.interp(x_center, fp_x, fp_y))
+            else:
+                y_fit_val = float(np.poly1d(coeffs)(x_center))
             
             has_actual = len(actual_in_bin) > 0
             has_fitted = True  # polynomial is defined everywhere
@@ -806,6 +948,10 @@ class CurveDigitizer:
             'light green': '#8bc34a', 'dark blue': '#1a237e', 'dark red': '#b71c1c',
             'brown': '#795548', 'teal': '#009688',
         }
+        # Extra cycle for curves keyed by non-standard names (gray_0, etc.)
+        _gs_cycle = ['#e74c3c', '#2196F3', '#27ae60', '#e67e22',
+                     '#9b59b6', '#00bcd4', '#795548', '#e91e63',
+                     '#f1c40f', '#1a237e']
         
         # ── Combined plot with all curves ──
         fig, ax = plt.subplots(figsize=(10, 7))
@@ -813,8 +959,8 @@ class CurveDigitizer:
         
         for color_name, curve_data in curves_data.items():
             fit = curve_data.get('fit_result', {})
-            coeffs = fit.get('coefficients')
-            if coeffs is None:
+            fitted_points = fit.get('fitted_points', [])
+            if not fitted_points:
                 continue
             
             fitted_points = fit.get('fitted_points', [])
@@ -826,7 +972,10 @@ class CurveDigitizer:
             y_vals = [p['y'] for p in fitted_points]
             label_text = curve_data.get('label', color_name)
             r_sq = fit.get('r_squared', 0)
-            plot_color = color_map.get(color_name.lower(), '#333333')
+            plot_color = color_map.get(color_name.lower(), None)
+            if plot_color is None:
+                ci = list(curves_data.keys()).index(color_name)
+                plot_color = _gs_cycle[ci % len(_gs_cycle)]
             
             ax.plot(x_vals, y_vals, color=plot_color, linewidth=2.5,
                     label=f"{label_text} (R²={r_sq:.4f})")
@@ -886,23 +1035,17 @@ class CurveDigitizer:
         
         if grayscale_mode and 'curves' in features:
             # ─── Grayscale path: connected-component extraction ───
-            # Filter out LLM curve entries that match axis labels (not real curves)
-            axis_words = set()
-            for field in ('xUnit', 'yUnit', 'imageDescription'):
-                val = self.axis_info.get(field, '')
-                if val:
-                    for w in str(val).lower().split():
-                        if len(w) > 2:
-                            axis_words.add(w)
-            
-            curve_features = []
-            for cf in features['curves']:
-                lbl = cf.get('label', '').lower()
-                clr = cf.get('color', '').lower()
-                # Skip if colour is black AND label overlaps an axis word
-                if clr == 'black' and any(w in lbl for w in axis_words):
-                    continue
-                curve_features.append(cf)
+            # Filter GPT features: remove surge/reference/axis entries
+            import re as _re
+            _NON_CURVE_KW = {'surge', 'axis', 'boundary', 'limit',
+                             'reference', 'design', 'dashed'}
+            curve_features = [
+                cf for cf in features['curves']
+                if not any(kw in cf.get('label', '').lower()
+                           for kw in _NON_CURVE_KW)
+                and not _re.match(r'^[\d.,\s]+$',
+                                  cf.get('label', '').strip())
+            ]
             
             num_curves = len(curve_features)
             if num_curves > 0:
@@ -927,12 +1070,15 @@ class CurveDigitizer:
                         continue
                     
                     axis_coords = self.normalize_to_axis(pixels, width, height, plot_area)
-                    cleaned_coords = self.clean_coordinates_ransac(axis_coords, threshold=0.03)
-                    fit_result = self.fit_polynomial_curve(cleaned_coords, degree=2)
+                    cleaned_coords = self.clean_coordinates_local(axis_coords)
+                    fit_result = self.fit_spline_curve(cleaned_coords)
                     metrics = self.calculate_curve_metrics(cleaned_coords, fit_result)
                     
                     results['curves'][color_key] = {
                         'label': label, 'color': color_key,
+                        'extraction_mode': 'grayscale',
+                        'raw_pixel_points': pixels,
+                        'plot_area': list(plot_area),
                         'original_point_count': len(pixels),
                         'normalized_point_count': len(axis_coords),
                         'cleaned_point_count': len(cleaned_coords),
@@ -941,16 +1087,26 @@ class CurveDigitizer:
         
         elif 'curves' in features:
             # ─── Colour path: dynamic RGB extraction ───
+            _DARK_NAMES = {'black', 'gray', 'grey', 'dark gray', 'dark grey'}
+            all_colors = [cf.get('color', 'unknown').lower()
+                          for cf in features['curves']]
+            has_colored_series = any(c not in _DARK_NAMES for c in all_colors)
+
             for idx, curve_feature in enumerate(features['curves']):
                 color = curve_feature.get('color', 'unknown')
                 label = curve_feature.get('label', f'Curve {idx+1}')
                 
-                # Skip black — typically used for reference/axis lines, not data curves
-                if color.lower() == 'black':
+                # Skip dark / axis colours when real coloured curves exist
+                if color.lower() in _DARK_NAMES and has_colored_series:
                     continue
                 
                 # Extract pixels using dynamic RGB range adaptation
                 pixels = self.extract_color_pixels_dynamic(image, color)
+                
+                # ── Filter pixels to within the plot area ──
+                p_left, p_top, p_right, p_bottom = plot_area
+                pixels = [(x, y) for x, y in pixels
+                          if p_left <= x <= p_right and p_top <= y <= p_bottom]
                 
                 if len(pixels) < 2:
                     results['curves'][color] = {
@@ -963,11 +1119,11 @@ class CurveDigitizer:
                 # Normalize to axis coordinates using detected plot area
                 axis_coords = self.normalize_to_axis(pixels, width, height, plot_area)
                 
-                # Clean coordinates with RANSAC
-                cleaned_coords = self.clean_coordinates_ransac(axis_coords, threshold=0.05)
+                # Clean with shape-preserving local filter
+                cleaned_coords = self.clean_coordinates_local(axis_coords)
                 
-                # Fit polynomial curve
-                fit_result = self.fit_polynomial_curve(cleaned_coords, degree=2)
+                # Spline fit (handles any curve shape)
+                fit_result = self.fit_spline_curve(cleaned_coords)
                 
                 # Calculate quality metrics
                 metrics = self.calculate_curve_metrics(cleaned_coords, fit_result)
@@ -975,6 +1131,7 @@ class CurveDigitizer:
                 results['curves'][color] = {
                     'label': label,
                     'color': color,
+                    'plot_area': list(plot_area),
                     'original_point_count': len(pixels),
                     'normalized_point_count': len(axis_coords),
                     'cleaned_point_count': len(cleaned_coords),

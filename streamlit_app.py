@@ -207,51 +207,54 @@ def main():
             'content': user_input
         })
         
-        # Classify intent
-        intent = client.classify_intent(user_input)
-        
-        # Process based on intent
-        if intent == 'imageprocessing':
-            if uploaded_file:
+        # ── Decision logic ──
+        # When a file IS uploaded, always process it as an image—regardless
+        # of how the user phrased their prompt.  Intent classification is
+        # only used when NO file is present.
+        if uploaded_file:
+            st.session_state.chat_history.append({
+                'role': 'bot',
+                'content': '🔄 Processing image...'
+            })
+            
+            # Process image
+            results = process_image(client, uploaded_file, user_input, output_dir)
+            
+            if results:
+                # Update chat with summary
+                axis_info = results.get('axis_info', {})
+                features_summary = {
+                    'curves': [{'color': c} for c in results.get('curves', {}).keys()]
+                }
+                summary = display_processing_summary(axis_info, features_summary)
+                
                 st.session_state.chat_history.append({
                     'role': 'bot',
-                    'content': '🔄 Processing image...'
+                    'content': summary
                 })
                 
-                # Process image
-                results = process_image(client, uploaded_file, user_input, output_dir)
-                
-                if results:
-                    # Update chat with summary
-                    axis_info = results.get('axis_info', {})
-                    features_summary = {
-                        'curves': [{'color': c} for c in results.get('curves', {}).keys()]
-                    }
-                    summary = display_processing_summary(axis_info, features_summary)
-                    
-                    st.session_state.chat_history.append({
-                        'role': 'bot',
-                        'content': summary
-                    })
-                    
-                    st.session_state.results_history.append(results)
-                else:
-                    st.session_state.chat_history.append({
-                        'role': 'bot',
-                        'content': '❌ Failed to process image. Please check the image format and try again.'
-                    })
+                st.session_state.results_history.append(results)
             else:
-                response = "I detected this is about image processing, but I don't see an image. Please upload an image file to process."
+                st.session_state.chat_history.append({
+                    'role': 'bot',
+                    'content': '❌ Failed to process image. Please check the image format and try again.'
+                })
+        else:
+            # No file uploaded – check intent to give helpful guidance
+            intent = client.classify_intent(user_input)
+            if intent == 'imageprocessing':
+                response = ("It looks like you want to process an image. "
+                            "Please upload an image file using the uploader above and try again.")
                 st.session_state.chat_history.append({
                     'role': 'bot',
                     'content': response
                 })
-        else:  # General response
-            response = client.get_general_response(user_input)
-            st.session_state.chat_history.append({
-                'role': 'bot',
-                'content': response
-            })
+            else:
+                response = client.get_general_response(user_input)
+                st.session_state.chat_history.append({
+                    'role': 'bot',
+                    'content': response
+                })
         
         st.rerun()
     

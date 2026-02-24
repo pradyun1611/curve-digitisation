@@ -107,6 +107,8 @@ def display_image_results(results: Dict[str, Any]) -> None:
                         if isinstance(coeffs, list):
                             for i, coeff in enumerate(coeffs):
                                 st.write(f"  c{i} = {coeff:.6f}")
+                    elif fit.get('equation'):
+                        st.write(f"**Fit Type:** {fit.get('equation')}")
                     
                     if fit.get('error'):
                         st.error(f"**Error:** {fit['error']}")
@@ -141,6 +143,16 @@ def display_image_results(results: Dict[str, Any]) -> None:
     else:
         st.warning("No curves detected in the image.")
     
+    # ── Display the generated digitized output graph ──
+    output_graphs = results.get('output_graphs', {})
+    if output_graphs:
+        st.subheader("📊 Reconstructed Digitized Curves")
+        for graph_name, graph_path in output_graphs.items():
+            import os
+            if os.path.exists(graph_path):
+                st.image(graph_path, caption=graph_name.replace('_', ' ').title(),
+                         use_container_width=True)
+
     # Download results
     if results.get('output_file'):
         with open(results['output_file'], 'r') as f:
