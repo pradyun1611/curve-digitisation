@@ -264,6 +264,144 @@ class CurveDigitizer:
         
         return pixels
     
+    # ─────────────────────────────────────────────────────────────
+    #  Grayscale / B&W image support
+    # ─────────────────────────────────────────────────────────────
+    
+    def is_grayscale_image(self, image: Image.Image) -> bool:
+        """
+        Detect whether an image is grayscale (B&W / shades of gray).
+        
+        A pixel is considered grayscale if |R-G|, |R-B|, and |G-B| are all
+        within a tight tolerance.  The image is grayscale when >= 85% of
+        non-background pixels satisfy that condition.
+        """
+        img_array = np.array(image).astype(np.float32)
+        r, g, b = img_array[:, :, 0], img_array[:, :, 1], img_array[:, :, 2]
+        brightness = (r + g + b) / 3.0
+        
+        # Only test pixels that aren't background (white) or axes (black)
+        mask = (brightness > 25) & (brightness < 240)
+        if np.sum(mask) < 50:
+            return False
+        
+        max_diff = np.maximum(
+            np.maximum(np.abs(r[mask] - g[mask]), np.abs(r[mask] - b[mask])),
+            np.abs(g[mask] - b[mask])
+        )
+        grayscale_ratio = float(np.sum(max_diff <= 12) / len(max_diff))
+        return bool(grayscale_ratio >= 0.85)
+    
+    def extract_curves_grayscale(self, image: Image.Image, num_curves: int,
+                                  plot_area: Tuple[int, int, int, int]
+                                  ) -> Dict[int, List[Tuple[int, int]]]:
+        """
+        Extract curves from a grayscale image using connected-component analysis.
+        
+        Strategy:
+        1. Threshold to mid-brightness pixels (skip black axes / white bg)
+        2. Find connected components (scipy.ndimage.label)
+        3. Keep only components with sufficient horizontal extent (real curves)
+           — this naturally removes text labels, dashed-line segments, tick marks
+        4. Sort remaining components by mean y-position (top = index 0)
+        5. Column-median thinning for a clean 1-pixel-wide skeleton per curve
+        
+        Args:
+            image: PIL Image
+            num_curves: Expected curve count (from LLM)
+            plot_area: (left, top, right, bottom) px bounds
+            
+        Returns:
+            Dict mapping curve index (0 = topmost) to list of (x, y) pixel coords
+        """
+        from scipy.ndimage import label as ndimage_label
+        
+        img_array = np.array(image).astype(np.float32)
+        p_left, p_top, p_right, p_bottom = plot_area
+        
+        # Inset by a few pixels to skip axis-line pixels sitting at the edge
+        inset = 5
+        p_left  = min(p_left + inset,  p_right - 1)
+        p_top   = min(p_top + inset,   p_bottom - 1)
+        p_right = max(p_right - inset,  p_left + 1)
+        p_bottom = max(p_bottom - inset, p_top + 1)
+        
+        region = img_array[p_top:p_bottom, p_left:p_right, :3]
+        gray = np.mean(region, axis=2)
+        region_h, region_w = gray.shape
+        
+        # ── Step 1: Binary mask of candidate curve pixels ──
+        # Brightness 55-205: excludes black axes/dashed ref lines (< 55)
+        # and white/light-gray background (> 205)
+        binary = (gray > 55) & (gray < 205)
+        
+        # ── Step 2: Connected components (4-connectivity) ──
+        structure = np.array([[0, 1, 0],
+                              [1, 1, 1],
+                              [0, 1, 0]])      # 4-connectivity kernel
+        labelled, n_components = ndimage_label(binary, structure=structure)
+        
+        # ── Step 3: Filter by horizontal extent ──
+        min_width = int(region_w * 0.12)        # curve must span ≥ 12% of plot
+        
+        valid_components = []
+        for comp_id in range(1, n_components + 1):
+            ys, xs = np.where(labelled == comp_id)
+            h_extent = xs.max() - xs.min() + 1
+            
+            if h_extent < min_width:
+                continue
+            
+            # Also skip components that are essentially horizontal/vertical lines
+            # (reference line remnants): aspect ratio check
+            v_extent = ys.max() - ys.min() + 1
+            aspect = h_extent / max(v_extent, 1)
+            
+            # Real curves are wider than tall but not extremely thin lines
+            # If component is as wide as 90%+ of plot and very thin (aspect > 50),
+            # it's likely a horizontal reference line remnant
+            if h_extent > region_w * 0.85 and aspect > 40:
+                continue
+            # If component is nearly full-height and very narrow, it's a vertical line
+            if v_extent > region_h * 0.85 and aspect < 0.03:
+                continue
+            
+            mean_y = float(np.mean(ys))
+            valid_components.append((comp_id, mean_y))
+        
+        # ── Step 4: Sort by mean y-position (top-of-image first) ──
+        valid_components.sort(key=lambda x: x[1])
+        
+        # If we found more components than expected, keep the largest ones
+        if len(valid_components) > num_curves:
+            # Re-sort by size, keep top num_curves, then re-sort by y
+            comp_sizes = []
+            for comp_id, mean_y in valid_components:
+                comp_sizes.append((comp_id, mean_y, int(np.sum(labelled == comp_id))))
+            comp_sizes.sort(key=lambda x: x[2], reverse=True)
+            valid_components = [(c[0], c[1]) for c in comp_sizes[:num_curves]]
+            valid_components.sort(key=lambda x: x[1])
+        
+        # ── Step 5: Column-median thinning per component ──
+        result: Dict[int, List[Tuple[int, int]]] = {}
+        for idx, (comp_id, _) in enumerate(valid_components):
+            ys, xs = np.where(labelled == comp_id)
+            
+            # Bucket by x-column
+            col_buckets: Dict[int, List[int]] = {}
+            for x_val, y_val in zip(xs, ys):
+                col_buckets.setdefault(int(x_val), []).append(int(y_val))
+            
+            thinned = []
+            for cx in sorted(col_buckets):
+                median_y = int(np.median(col_buckets[cx]))
+                # Map back from region coords to full-image coords
+                thinned.append((cx + p_left, median_y + p_top))
+            
+            result[idx] = thinned
+        
+        return result
+    
     def detect_plot_area(self, image: Image.Image, dark_threshold: int = 80,
                          line_ratio: float = 0.3) -> Tuple[int, int, int, int]:
         """
@@ -742,8 +880,67 @@ class CurveDigitizer:
             'curves': {}
         }
         
-        # Extract unique colors from features
-        if 'curves' in features:
+        # Auto-detect grayscale vs colour image
+        grayscale_mode = self.is_grayscale_image(image)
+        results['grayscale_mode'] = bool(grayscale_mode)
+        
+        if grayscale_mode and 'curves' in features:
+            # ─── Grayscale path: connected-component extraction ───
+            # Filter out LLM curve entries that match axis labels (not real curves)
+            axis_words = set()
+            for field in ('xUnit', 'yUnit', 'imageDescription'):
+                val = self.axis_info.get(field, '')
+                if val:
+                    for w in str(val).lower().split():
+                        if len(w) > 2:
+                            axis_words.add(w)
+            
+            curve_features = []
+            for cf in features['curves']:
+                lbl = cf.get('label', '').lower()
+                clr = cf.get('color', '').lower()
+                # Skip if colour is black AND label overlaps an axis word
+                if clr == 'black' and any(w in lbl for w in axis_words):
+                    continue
+                curve_features.append(cf)
+            
+            num_curves = len(curve_features)
+            if num_curves > 0:
+                gray_clusters = self.extract_curves_grayscale(
+                    image, num_curves, plot_area
+                )
+                
+                for cluster_idx, pixels in gray_clusters.items():
+                    if cluster_idx < len(curve_features):
+                        cf = curve_features[cluster_idx]
+                        color_key = cf.get('color', f'gray_{cluster_idx}')
+                        label = cf.get('label', f'Curve {cluster_idx + 1}')
+                    else:
+                        color_key = f'gray_{cluster_idx}'
+                        label = f'Curve {cluster_idx + 1}'
+                    
+                    if len(pixels) < 2:
+                        results['curves'][color_key] = {
+                            'label': label, 'color': color_key,
+                            'error': f'Insufficient pixels in component {cluster_idx}'
+                        }
+                        continue
+                    
+                    axis_coords = self.normalize_to_axis(pixels, width, height, plot_area)
+                    cleaned_coords = self.clean_coordinates_ransac(axis_coords, threshold=0.03)
+                    fit_result = self.fit_polynomial_curve(cleaned_coords, degree=2)
+                    metrics = self.calculate_curve_metrics(cleaned_coords, fit_result)
+                    
+                    results['curves'][color_key] = {
+                        'label': label, 'color': color_key,
+                        'original_point_count': len(pixels),
+                        'normalized_point_count': len(axis_coords),
+                        'cleaned_point_count': len(cleaned_coords),
+                        'fit_result': fit_result, 'metrics': metrics
+                    }
+        
+        elif 'curves' in features:
+            # ─── Colour path: dynamic RGB extraction ───
             for idx, curve_feature in enumerate(features['curves']):
                 color = curve_feature.get('color', 'unknown')
                 label = curve_feature.get('label', f'Curve {idx+1}')
