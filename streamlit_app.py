@@ -140,6 +140,12 @@ def process_image(client: OpenAIClient, image_file, user_query: str, output_dir:
         
         results['output_file'] = str(output_file)
         
+        # Copy input image to instance folder so it survives temp cleanup
+        import shutil
+        input_copy = str(instance_dir / f"input_{Path(temp_path).name}")
+        shutil.copy2(temp_path, input_copy)
+        results['input_image_path'] = input_copy
+        
         # Clean up temp file
         if Path(temp_path).exists():
             Path(temp_path).unlink()

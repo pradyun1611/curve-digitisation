@@ -884,7 +884,6 @@ class CurveDigitizer:
         if has_valid_curves:
             ax.set_xlabel(x_label, fontsize=12)
             ax.set_ylabel(y_label, fontsize=12)
-            ax.set_title(f"Digitized Curves — {description}", fontsize=14, fontweight='bold')
             ax.legend(loc='best', fontsize=9, framealpha=0.9)
             ax.grid(True, alpha=0.3, linestyle='--')
             ax.set_xlim(self.xMin, self.xMax)

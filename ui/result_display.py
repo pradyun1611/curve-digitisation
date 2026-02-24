@@ -6,6 +6,7 @@ Handles visualization of image processing results.
 
 import streamlit as st
 import json
+from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional
 
@@ -39,6 +40,27 @@ def display_image_results(results: Dict[str, Any]) -> None:
         dims = results.get('image_dimensions', {})
         st.write(f"**Width:** {dims.get('width', 'N/A')} px")
         st.write(f"**Height:** {dims.get('height', 'N/A')} px")
+    
+    # ── Input vs Output Image Comparison ──
+    input_img = results.get('input_image_path', results.get('image_path', ''))
+    output_graphs = results.get('output_graphs', {})
+    output_img = output_graphs.get('all_curves', '')
+    
+    if (input_img and Path(input_img).exists()) or (output_img and Path(output_img).exists()):
+        st.subheader("🖼️ Input vs Output Comparison")
+        img_col1, img_col2 = st.columns(2)
+        
+        with img_col1:
+            if input_img and Path(input_img).exists():
+                st.image(input_img, caption="Input Image", use_container_width=True)
+            else:
+                st.info("Input image not available.")
+        
+        with img_col2:
+            if output_img and Path(output_img).exists():
+                st.image(output_img, caption="Digitized Output", use_container_width=True)
+            else:
+                st.info("Output graph not available.")
     
     # ── Overall Graph Metrics ──
     overall = results.get('overall_metrics', {})
