@@ -381,9 +381,11 @@ class CurveDigitizer:
         region_h, region_w = gray.shape
         
         # ── Step 1: Binary mask of candidate curve pixels ──
-        # Brightness 55-205: excludes black axes/dashed ref lines (< 55)
-        # and white/light-gray background (> 205)
-        binary = (gray > 55) & (gray < 205)
+        # Brightness 20-205: excludes solid-black axes (< 20)
+        # and white/light-gray background (> 205).
+        # The low threshold (20) allows very dark curves to be captured;
+        # axis-line remnants are eliminated later by the shape filters.
+        binary = (gray > 20) & (gray < 205)
         
         # ── Step 2: Connected components (4-connectivity) ──
         structure = np.array([[0, 1, 0],
@@ -422,15 +424,8 @@ class CurveDigitizer:
         # ── Step 4: Sort by mean y-position (top-of-image first) ──
         valid_components.sort(key=lambda x: x[1])
         
-        # If we found more components than expected, keep the largest ones
-        if len(valid_components) > num_curves:
-            # Re-sort by size, keep top num_curves, then re-sort by y
-            comp_sizes = []
-            for comp_id, mean_y in valid_components:
-                comp_sizes.append((comp_id, mean_y, int(np.sum(labelled == comp_id))))
-            comp_sizes.sort(key=lambda x: x[2], reverse=True)
-            valid_components = [(c[0], c[1]) for c in comp_sizes[:num_curves]]
-            valid_components.sort(key=lambda x: x[1])
+        # Keep ALL valid components — the LLM may under-count curves.
+        # Shape / extent filters above are sufficient to weed out noise.
         
         # ── Step 5: Column-median thinning per component ──
         result: Dict[int, List[Tuple[int, int]]] = {}
@@ -1110,9 +1105,64 @@ class CurveDigitizer:
                     image, num_curves, plot_area
                 )
                 
+                # ── Sort labels to match spatial cluster order ──
+                # Clusters are sorted top-first (smallest y-pixel).
+                # On a standard chart the topmost curve has the
+                # highest numeric value, so sort labels descending.
+                def _label_num(cf):
+                    nums = _re.findall(r'[\d.]+',
+                                       str(cf.get('label', '')))
+                    return float(nums[0]) if nums else 0.0
+
+                curve_features_sorted = sorted(
+                    curve_features,
+                    key=_label_num,
+                    reverse=(self.yMax >= self.yMin),
+                )
+
+                # If extraction found more components than the LLM
+                # reported, build extra labels by extrapolating the
+                # numeric series the LLM gave us.  Clusters are sorted
+                # top-first, i.e. highest chart value first, so any
+                # extra curves the LLM missed are most likely at the
+                # top (higher values).
+                n_clusters = len(gray_clusters)
+                if n_clusters > len(curve_features_sorted):
+                    known_vals = sorted(
+                        [_label_num(cf) for cf in curve_features_sorted],
+                        reverse=True,          # descending: highest first
+                    )
+                    if len(known_vals) >= 2:
+                        step = known_vals[0] - known_vals[1]    # gap between adjacent
+                        if step == 0:
+                            step = 10
+                    else:
+                        step = 10
+
+                    n_extra = n_clusters - len(known_vals)
+                    # Extrapolate *upward* from the highest known value
+                    top_val = known_vals[0] + step * n_extra
+                    full_vals = [top_val - i * step
+                                 for i in range(n_clusters)]
+
+                    # Re-build curve_features_sorted with correct count
+                    new_features = []
+                    for i, val in enumerate(full_vals):
+                        lbl = str(int(val)) if val == int(val) else str(val)
+                        if i < n_extra:
+                            # brand-new extrapolated entry (above LLM range)
+                            cf_copy = {'color': f'gray_{i}', 'label': lbl}
+                        else:
+                            # reuse existing LLM feature, override label
+                            cf_copy = dict(
+                                curve_features_sorted[i - n_extra])
+                            cf_copy['label'] = lbl
+                        new_features.append(cf_copy)
+                    curve_features_sorted = new_features
+
                 for cluster_idx, pixels in gray_clusters.items():
-                    if cluster_idx < len(curve_features):
-                        cf = curve_features[cluster_idx]
+                    if cluster_idx < len(curve_features_sorted):
+                        cf = curve_features_sorted[cluster_idx]
                         color_key = cf.get('color', f'gray_{cluster_idx}')
                         label = cf.get('label', f'Curve {cluster_idx + 1}')
                     else:
