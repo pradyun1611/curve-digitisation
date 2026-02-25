@@ -1426,8 +1426,8 @@ class CurveDigitizer:
                 # Clean with shape-preserving local filter
                 cleaned_coords = self.clean_coordinates_local(axis_coords)
                 
-                # Spline fit (handles any curve shape)
-                fit_result = self.fit_spline_curve(cleaned_coords)
+                # Polynomial fit (degree 2 — performance curves are parabolic)
+                fit_result = self.fit_polynomial_curve(cleaned_coords, degree=2)
                 
                 # Calculate quality metrics
                 metrics = self.calculate_curve_metrics(cleaned_coords, fit_result)
