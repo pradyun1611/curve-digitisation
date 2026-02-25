@@ -22,7 +22,7 @@ import shutil
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
 
@@ -34,8 +34,13 @@ except ImportError:
 
 load_dotenv()
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import Response, StreamingResponse
+try:
+    from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+    from fastapi.responses import JSONResponse, Response, StreamingResponse
+except ImportError as _exc:  # pragma: no cover
+    raise ImportError(
+        "fastapi is not installed. Run: pip install 'fastapi[standard]' uvicorn"
+    ) from _exc
 
 from core.io_utils import build_download_zip, list_job_artifacts, load_report_json
 from core.metrics import (
@@ -54,6 +59,30 @@ logger = logging.getLogger(__name__)
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "./output")
 
 app = FastAPI(title="Curve Digitization API", version="1.0.0")
+
+
+def _numpy_safe(obj: Any) -> Any:
+    """Convert numpy types → native Python for JSON serialization."""
+    import numpy as _np
+    if isinstance(obj, _np.integer):
+        return int(obj)
+    if isinstance(obj, _np.floating):
+        return float(obj)
+    if isinstance(obj, _np.bool_):
+        return bool(obj)
+    if isinstance(obj, _np.ndarray):
+        return obj.tolist()
+    return str(obj)
+
+
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Any, exc: Exception) -> JSONResponse:
+    """Return a structured JSON error for any unhandled exception."""
+    logger.exception("Unhandled error: %s", exc)
+    return JSONResponse(
+        status_code=500,
+        content={"error": str(exc), "type": type(exc).__name__},
+    )
 
 
 def _get_openai_client() -> OpenAIClient:
@@ -115,7 +144,9 @@ async def analyze(
     # Cleanup temp
     shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
-    return result.to_dict()
+    # Return as JSON with numpy-safe serialization
+    payload = json.loads(json.dumps(result.to_dict(), default=_numpy_safe))
+    return payload
 
 
 # ------------------------------------------------------------------

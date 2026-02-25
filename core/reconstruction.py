@@ -17,10 +17,13 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 from PIL import Image
+
+if TYPE_CHECKING:
+    import cv2 as _cv2  # type: ignore[import-untyped]  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +170,7 @@ def render_overlay_comparison(
     logger.info("[%s] reconstruction: overlay canvas %dx%d", job_id, width, height)
 
     try:
-        import cv2
+        import cv2  # type: ignore[import-untyped]
         use_cv2 = True
     except ImportError:
         use_cv2 = False
@@ -190,7 +193,7 @@ def render_overlay_comparison(
                     job_id, name, len(pixel_pts))
 
         if use_cv2:
-            import cv2
+            import cv2  # type: ignore[import-untyped]
             pts_int = np.array(pixel_pts, dtype=np.int32).reshape(-1, 1, 2)
             bgr = _OVERLAY_COLORS_BGR[colour_idx % len(_OVERLAY_COLORS_BGR)]
             cv2.polylines(canvas, [pts_int], isClosed=False,

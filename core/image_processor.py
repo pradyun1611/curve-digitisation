@@ -10,8 +10,10 @@ Handles image digitization and curve fitting:
 - Digitized graph generation
 """
 
+import logging
+import os
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 import json
 from typing import List, Tuple, Dict, Any, Optional
 from pathlib import Path
@@ -21,6 +23,29 @@ import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server/headless use
 import matplotlib.pyplot as plt
 from datetime import datetime
+
+# ── Determinism: single-threaded BLAS/LAPACK ──────────────────────
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+np.random.seed(42)
+
+logger = logging.getLogger(__name__)
+
+# ── Optional debug-image persistence ──────────────────────────────
+_DEBUG_DIR = os.environ.get("CURVE_DEBUG_IMAGES", "")
+
+
+def _save_debug_image(tag: str, array: np.ndarray) -> None:
+    """Save a debug image to *_DEBUG_DIR* if the env-var is set."""
+    if not _DEBUG_DIR:
+        return
+    try:
+        out = Path(_DEBUG_DIR)
+        out.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(array).save(str(out / f"{tag}.png"))
+    except Exception:
+        pass
 
 
 class CurveDigitizer:
@@ -83,24 +108,35 @@ class CurveDigitizer:
         # Convert to RGB numpy array
         img_array = np.array(image)
         
+        # ── Try HSV-based extraction first (robust to JPEG/anti-aliasing) ──
+        hsv_pixels = self._extract_via_hsv(img_array, target_color_name)
+        if hsv_pixels is not None and len(hsv_pixels) >= 5:
+            logger.debug("extract_color_pixels: HSV path returned %d px for '%s'",
+                         len(hsv_pixels), target_color_name)
+            _save_debug_image(f"color_hsv_{target_color_name}",
+                              self._pixels_to_debug_mask(hsv_pixels, img_array.shape))
+            return hsv_pixels
+
+        # ── Fallback: RGB thresholds (wider ranges for tolerance) ──
         # Define color ranges (RGB thresholds)
         color_ranges = {
-            'red': {'r_min': 200, 'r_max': 255, 'g_max': 100, 'b_max': 100},
-            'blue': {'b_min': 150, 'b_max': 255, 'r_max': 50, 'g_max': 80},
-            'green': {'g_min': 200, 'g_max': 255, 'r_max': 100, 'b_max': 100},
-            'yellow': {'r_min': 200, 'g_min': 200, 'b_max': 100},
-            'orange': {'r_min': 200, 'g_min': 100, 'g_max': 200, 'b_max': 50},
-            'purple': {'r_min': 150, 'b_min': 150, 'g_max': 100},
-            'gray': {'r_min': 100, 'r_max': 200, 'g_min': 100, 'g_max': 200, 'b_min': 100, 'b_max': 200},
-            'magenta': {'r_min': 180, 'r_max': 255, 'g_max': 100, 'b_min': 180, 'b_max': 255},
-            'pink': {'r_min': 200, 'r_max': 255, 'g_max': 150, 'b_min': 150, 'b_max': 255},
-            'light blue': {'r_min': 130, 'r_max': 180, 'g_min': 130, 'g_max': 180, 'b_min': 235, 'b_max': 255},
-            'cyan': {'r_max': 100, 'g_min': 180, 'g_max': 255, 'b_min': 200, 'b_max': 255},
-            'light green': {'r_min': 100, 'r_max': 200, 'g_min': 200, 'g_max': 255, 'b_max': 150},
-            'dark blue': {'r_max': 50, 'g_max': 50, 'b_min': 150, 'b_max': 255},
-            'dark red': {'r_min': 139, 'r_max': 200, 'g_max': 50, 'b_max': 50},
-            'brown': {'r_min': 120, 'r_max': 200, 'g_min': 50, 'g_max': 120, 'b_max': 80},
-            'teal': {'r_max': 80, 'g_min': 128, 'g_max': 200, 'b_min': 128, 'b_max': 200},
+            'red': {'r_min': 170, 'r_max': 255, 'g_max': 120, 'b_max': 120},
+            'blue': {'b_min': 120, 'b_max': 255, 'r_max': 80, 'g_max': 100},
+            'green': {'g_min': 150, 'g_max': 255, 'r_max': 130, 'b_max': 130},
+            'yellow': {'r_min': 180, 'g_min': 180, 'b_max': 120},
+            'orange': {'r_min': 180, 'g_min': 80, 'g_max': 200, 'b_max': 80},
+            'purple': {'r_min': 120, 'b_min': 120, 'g_max': 120},
+            'gray': {'r_min': 80, 'r_max': 210, 'g_min': 80, 'g_max': 210, 'b_min': 80, 'b_max': 210},
+            'black': {'r_max': 80, 'g_max': 80, 'b_max': 80},
+            'magenta': {'r_min': 160, 'r_max': 255, 'g_max': 120, 'b_min': 160, 'b_max': 255},
+            'pink': {'r_min': 180, 'r_max': 255, 'g_max': 170, 'b_min': 130, 'b_max': 255},
+            'light blue': {'r_min': 100, 'r_max': 200, 'g_min': 100, 'g_max': 200, 'b_min': 200, 'b_max': 255},
+            'cyan': {'r_max': 120, 'g_min': 160, 'g_max': 255, 'b_min': 180, 'b_max': 255},
+            'light green': {'r_min': 80, 'r_max': 210, 'g_min': 180, 'g_max': 255, 'b_max': 170},
+            'dark blue': {'r_max': 70, 'g_max': 70, 'b_min': 120, 'b_max': 255},
+            'dark red': {'r_min': 120, 'r_max': 210, 'g_max': 70, 'b_max': 70},
+            'brown': {'r_min': 100, 'r_max': 210, 'g_min': 40, 'g_max': 140, 'b_max': 100},
+            'teal': {'r_max': 100, 'g_min': 110, 'g_max': 210, 'b_min': 110, 'b_max': 210},
         }
         
         target_color = target_color_name.lower()
@@ -150,9 +186,79 @@ class CurveDigitizer:
         """Convert a 2-D boolean mask to a list of (x, y) pixel coordinates."""
         ys, xs = np.where(mask)
         return list(zip(xs.tolist(), ys.tolist()))
-    
+
+    # ─────────────────────────────────────────────────────────────
+    #  HSV-based colour extraction  (cross-machine robust)
+    # ─────────────────────────────────────────────────────────────
+
+    _HSV_RANGES: Dict[str, List[Tuple[Tuple[int,int,int], Tuple[int,int,int]]]] = {
+        # Each entry is a list of (lower, upper) HSV tuples.
+        # H is 0-179 (PIL/numpy convention: 0-360 scaled to 0-179)
+        # S is 0-255,  V is 0-255.
+        'red':        [((0, 70, 80), (10, 255, 255)),
+                       ((170, 70, 80), (179, 255, 255))],     # red wraps around hue 0
+        'blue':       [((100, 70, 50), (130, 255, 255))],
+        'green':      [((35, 50, 50), (85, 255, 255))],
+        'yellow':     [((20, 80, 80), (35, 255, 255))],
+        'orange':     [((10, 100, 100), (22, 255, 255))],
+        'purple':     [((125, 40, 40), (160, 255, 255))],
+        'magenta':    [((145, 60, 80), (175, 255, 255))],
+        'pink':       [((140, 30, 150), (175, 255, 255))],
+        'cyan':       [((80, 70, 70), (100, 255, 255))],
+        'teal':       [((80, 50, 50), (100, 255, 200))],
+        'light blue': [((95, 40, 120), (115, 255, 255))],
+        'dark blue':  [((100, 80, 30), (130, 255, 180))],
+        'dark red':   [((0, 80, 40), (10, 255, 180)),
+                       ((170, 80, 40), (179, 255, 180))],
+        'light green':[((35, 30, 100), (85, 200, 255))],
+        'brown':      [((8, 60, 30), (22, 255, 180))],
+    }
+
+    def _extract_via_hsv(self, img_rgb: np.ndarray,
+                         color_name: str) -> Optional[List[Tuple[int, int]]]:
+        """Extract pixels for *color_name* using HSV ranges.
+
+        Returns ``None`` if the colour name has no HSV definition
+        (caller should fall back to RGB thresholds).
+
+        This is more robust than pure RGB because HSV separates
+        luminance from chrominance — JPEG artifacts, anti-aliasing,
+        and monitor gamma differences mainly affect V, not H/S.
+        """
+        key = color_name.strip().lower()
+        ranges = self._HSV_RANGES.get(key)
+        if ranges is None:
+            return None
+
+        # Convert RGB → HSV (PIL: H 0-179, S 0-255, V 0-255)
+        hsv = np.array(Image.fromarray(img_rgb).convert('HSV'))
+
+        combined_mask = np.zeros(hsv.shape[:2], dtype=bool)
+        for lo, hi in ranges:
+            lo_arr = np.array(lo, dtype=np.uint8)
+            hi_arr = np.array(hi, dtype=np.uint8)
+            mask = (
+                (hsv[:, :, 0] >= lo_arr[0]) & (hsv[:, :, 0] <= hi_arr[0]) &
+                (hsv[:, :, 1] >= lo_arr[1]) & (hsv[:, :, 1] <= hi_arr[1]) &
+                (hsv[:, :, 2] >= lo_arr[2]) & (hsv[:, :, 2] <= hi_arr[2])
+            )
+            combined_mask |= mask
+
+        return self._mask_to_coords(combined_mask)
+
+    @staticmethod
+    def _pixels_to_debug_mask(pixels: List[Tuple[int, int]],
+                              shape: Tuple[int, ...]) -> np.ndarray:
+        """Create a binary debug image from a pixel list."""
+        h, w = shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        for x, y in pixels:
+            if 0 <= y < h and 0 <= x < w:
+                mask[y, x] = 255
+        return mask
+
     def _calculate_dynamic_color_range(self, rgb_samples: List[Tuple[int, int, int]], 
-                                       margin_std: float = 1.0) -> Dict[str, int]:
+                                       margin_std: float = 2.5) -> Dict[str, int]:
         """
         Calculate dynamic RGB range from sampled pixels.
         
@@ -176,10 +282,10 @@ class CurveDigitizer:
         g_mean, g_std = np.mean(g_vals), np.std(g_vals)
         b_mean, b_std = np.mean(b_vals), np.std(b_vals)
         
-        # Create ranges with margin
-        margin_r = max(r_std * margin_std, 5)  # Minimum margin of 5
-        margin_g = max(g_std * margin_std, 5)
-        margin_b = max(b_std * margin_std, 5)
+        # Create ranges with margin (generous minimum for JPEG tolerance)
+        margin_r = max(r_std * margin_std, 15)
+        margin_g = max(g_std * margin_std, 15)
+        margin_b = max(b_std * margin_std, 15)
         
         return {
             'r_min': max(0, int(r_mean - margin_r)),
@@ -209,24 +315,25 @@ class CurveDigitizer:
         img_array = np.array(image)
         target_color = target_color_name.lower()
         
-        # Hardcoded color ranges for initial pass
+        # Hardcoded color ranges for initial pass (same widened ranges as extract_color_pixels)
         color_ranges = {
-            'red': {'r_min': 200, 'r_max': 255, 'g_max': 100, 'b_max': 100},
-            'blue': {'b_min': 150, 'b_max': 255, 'r_max': 50, 'g_max': 80},
-            'green': {'g_min': 200, 'g_max': 255, 'r_max': 100, 'b_max': 100},
-            'yellow': {'r_min': 200, 'g_min': 200, 'b_max': 100},
-            'orange': {'r_min': 200, 'g_min': 100, 'g_max': 200, 'b_max': 50},
-            'purple': {'r_min': 150, 'b_min': 150, 'g_max': 100},
-            'gray': {'r_min': 100, 'r_max': 200, 'g_min': 100, 'g_max': 200, 'b_min': 100, 'b_max': 200},
-            'magenta': {'r_min': 180, 'r_max': 255, 'g_max': 100, 'b_min': 180, 'b_max': 255},
-            'pink': {'r_min': 200, 'r_max': 255, 'g_max': 150, 'b_min': 150, 'b_max': 255},
-            'light blue': {'r_min': 130, 'r_max': 180, 'g_min': 130, 'g_max': 180, 'b_min': 235, 'b_max': 255},
-            'cyan': {'r_max': 100, 'g_min': 180, 'g_max': 255, 'b_min': 200, 'b_max': 255},
-            'light green': {'r_min': 100, 'r_max': 200, 'g_min': 200, 'g_max': 255, 'b_max': 150},
-            'dark blue': {'r_max': 50, 'g_max': 50, 'b_min': 150, 'b_max': 255},
-            'dark red': {'r_min': 139, 'r_max': 200, 'g_max': 50, 'b_max': 50},
-            'brown': {'r_min': 120, 'r_max': 200, 'g_min': 50, 'g_max': 120, 'b_max': 80},
-            'teal': {'r_max': 80, 'g_min': 128, 'g_max': 200, 'b_min': 128, 'b_max': 200},
+            'red': {'r_min': 170, 'r_max': 255, 'g_max': 120, 'b_max': 120},
+            'blue': {'b_min': 120, 'b_max': 255, 'r_max': 80, 'g_max': 100},
+            'green': {'g_min': 150, 'g_max': 255, 'r_max': 130, 'b_max': 130},
+            'yellow': {'r_min': 180, 'g_min': 180, 'b_max': 120},
+            'orange': {'r_min': 180, 'g_min': 80, 'g_max': 200, 'b_max': 80},
+            'purple': {'r_min': 120, 'b_min': 120, 'g_max': 120},
+            'gray': {'r_min': 80, 'r_max': 210, 'g_min': 80, 'g_max': 210, 'b_min': 80, 'b_max': 210},
+            'black': {'r_max': 80, 'g_max': 80, 'b_max': 80},
+            'magenta': {'r_min': 160, 'r_max': 255, 'g_max': 120, 'b_min': 160, 'b_max': 255},
+            'pink': {'r_min': 180, 'r_max': 255, 'g_max': 170, 'b_min': 130, 'b_max': 255},
+            'light blue': {'r_min': 100, 'r_max': 200, 'g_min': 100, 'g_max': 200, 'b_min': 200, 'b_max': 255},
+            'cyan': {'r_max': 120, 'g_min': 160, 'g_max': 255, 'b_min': 180, 'b_max': 255},
+            'light green': {'r_min': 80, 'r_max': 210, 'g_min': 180, 'g_max': 255, 'b_max': 170},
+            'dark blue': {'r_max': 70, 'g_max': 70, 'b_min': 120, 'b_max': 255},
+            'dark red': {'r_min': 120, 'r_max': 210, 'g_max': 70, 'b_max': 70},
+            'brown': {'r_min': 100, 'r_max': 210, 'g_min': 40, 'g_max': 140, 'b_max': 100},
+            'teal': {'r_max': 100, 'g_min': 110, 'g_max': 210, 'b_min': 110, 'b_max': 210},
         }
         
         if target_color not in color_ranges:
@@ -253,7 +360,9 @@ class CurveDigitizer:
             return initial_pixels
         
         # ─── PASS 2: Final extraction with dynamic range (vectorized) ───
-        final_mask = self._vectorized_color_mask(img_array, dynamic_range)
+        # Union initial + dynamic masks to avoid losing pixels from Pass 1
+        final_mask = initial_mask | self._vectorized_color_mask(img_array, dynamic_range)
+        _save_debug_image(f"dynamic_{target_color}", final_mask)
         final_pixels = self._mask_to_coords(final_mask)
         
         return final_pixels if final_pixels else initial_pixels
@@ -303,14 +412,28 @@ class CurveDigitizer:
         if n_components <= 1:
             return pixels
         
-        # Find the largest component
+        # Keep ALL components that span enough of the image width
+        # (real curves are wide; stray colour blobs are narrow)
+        min_hspan = max(10, int(image_width * 0.05))  # >= 5% of width
         component_sizes = np.bincount(labelled.ravel())
         component_sizes[0] = 0  # ignore background
-        largest_label = int(np.argmax(component_sizes))
-        
-        # Keep only pixels in the largest component
+
+        keep_labels = set()
+        for comp_id in range(1, n_components + 1):
+            if component_sizes[comp_id] < 5:
+                continue
+            ys_c, xs_c = np.where(labelled == comp_id)
+            hspan = int(xs_c.max()) - int(xs_c.min()) + 1
+            if hspan >= min_hspan:
+                keep_labels.add(comp_id)
+
+        # Fallback: if nothing passes the span test, keep just the largest
+        if not keep_labels:
+            largest_label = int(np.argmax(component_sizes))
+            keep_labels = {largest_label}
+
         filtered = [(x, y) for x, y in pixels
-                    if labelled[y, x] == largest_label]
+                    if labelled[y, x] in keep_labels]
         
         return filtered if len(filtered) >= 5 else pixels
     
@@ -346,106 +469,169 @@ class CurveDigitizer:
                                   plot_area: Tuple[int, int, int, int]
                                   ) -> Dict[int, List[Tuple[int, int]]]:
         """
-        Extract curves from a grayscale image using connected-component analysis.
-        
-        Strategy:
-        1. Threshold to mid-brightness pixels (skip black axes / white bg)
-        2. Find connected components (scipy.ndimage.label)
-        3. Keep only components with sufficient horizontal extent (real curves)
-           — this naturally removes text labels, dashed-line segments, tick marks
-        4. Sort remaining components by mean y-position (top = index 0)
-        5. Column-median thinning for a clean 1-pixel-wide skeleton per curve
-        
+        Extract curves from a grayscale / B&W image.
+
+        Robust pipeline (cross-machine deterministic):
+        1. Crop to plot area, convert to true grayscale (uint8).
+        2. Denoise with a small median filter (removes JPEG noise).
+        3. Adaptive Otsu threshold → binary mask of dark strokes.
+        4. Morphological close (connect broken dashes / thin lines).
+        5. Suppress horizontal/vertical grid lines (projection filter).
+        6. Connected-component labelling (8-connectivity).
+        7. Filter components by horizontal extent (real curves span the plot).
+        8. Sort by mean y (topmost = index 0).
+        9. Column-median thinning for a 1-px skeleton per curve.
+
+        This is robust to:
+        - Different JPEG quality / compression artifacts across machines
+        - Anti-aliasing differences (font rendering, line smoothing)
+        - Monitor DPI / image scaling (adaptive, not pixel-count based)
+
         Args:
             image: PIL Image
-            num_curves: Expected curve count (from LLM)
+            num_curves: Expected curve count (from LLM) — used as hint only
             plot_area: (left, top, right, bottom) px bounds
-            
+
         Returns:
             Dict mapping curve index (0 = topmost) to list of (x, y) pixel coords
         """
-        from scipy.ndimage import label as ndimage_label
-        
-        img_array = np.array(image).astype(np.float32)
+        from scipy.ndimage import label as ndimage_label, binary_closing, binary_opening
+
+        img_array = np.array(image)
         p_left, p_top, p_right, p_bottom = plot_area
-        
-        # Inset by a few pixels to skip axis-line pixels sitting at the edge
+
+        # Inset to skip axis-line pixels right at the boundary
         inset = 5
         p_left  = min(p_left + inset,  p_right - 1)
         p_top   = min(p_top + inset,   p_bottom - 1)
         p_right = max(p_right - inset,  p_left + 1)
         p_bottom = max(p_bottom - inset, p_top + 1)
-        
-        region = img_array[p_top:p_bottom, p_left:p_right, :3]
-        gray = np.mean(region, axis=2)
+
+        region = img_array[p_top:p_bottom, p_left:p_right]
+        if region.ndim == 3:
+            gray = np.mean(region[:, :, :3].astype(np.float32), axis=2).astype(np.uint8)
+        else:
+            gray = region.astype(np.uint8)
         region_h, region_w = gray.shape
-        
-        # ── Step 1: Binary mask of candidate curve pixels ──
-        # Brightness 20-205: excludes solid-black axes (< 20)
-        # and white/light-gray background (> 205).
-        # The low threshold (20) allows very dark curves to be captured;
-        # axis-line remnants are eliminated later by the shape filters.
-        binary = (gray > 20) & (gray < 205)
-        
-        # ── Step 2: Connected components (4-connectivity) ──
-        structure = np.array([[0, 1, 0],
-                              [1, 1, 1],
-                              [0, 1, 0]])      # 4-connectivity kernel
-        labelled, n_components = ndimage_label(binary, structure=structure)
-        
-        # ── Step 3: Filter by horizontal extent ──
-        min_width = int(region_w * 0.12)        # curve must span ≥ 12% of plot
-        
+        logger.debug("grayscale extraction: region %dx%d", region_w, region_h)
+
+        # ── Step 1: Denoise (3×3 median — removes salt-and-pepper) ──
+        gray_pil = Image.fromarray(gray).filter(ImageFilter.MedianFilter(size=3))
+        gray = np.array(gray_pil)
+
+        # ── Step 2: Adaptive Otsu threshold ──
+        threshold = self._otsu_threshold(gray)
+        # We want dark-on-light: pixels darker than threshold → True
+        binary = gray < threshold
+        _save_debug_image("gs_binary", binary)
+
+        # ── Step 3: Morphological close to connect dashes / thin strokes ──
+        close_kernel = np.ones((3, 5), dtype=bool)   # wider than tall → connect along x
+        binary = binary_closing(binary, structure=close_kernel, iterations=1)
+
+        # ── Step 4: Suppress horizontal / vertical grid lines ──
+        # A row is a grid line if >75% of its pixels are dark
+        row_fill = binary.sum(axis=1) / region_w
+        grid_rows = row_fill > 0.75
+        binary[grid_rows, :] = False
+        # Same for columns
+        col_fill = binary.sum(axis=0) / region_h
+        grid_cols = col_fill > 0.75
+        binary[:, grid_cols] = False
+        _save_debug_image("gs_after_grid_suppress", binary)
+
+        # Small opening to remove residual specks after grid removal
+        open_kernel = np.ones((2, 2), dtype=bool)
+        binary = binary_opening(binary, structure=open_kernel, iterations=1)
+
+        # ── Step 5: Connected components (8-connectivity) ──
+        structure_8 = np.ones((3, 3), dtype=int)
+        labelled, n_components = ndimage_label(binary, structure=structure_8)
+        logger.debug("grayscale extraction: %d components before filtering", n_components)
+
+        # ── Step 6: Filter by horizontal extent ──
+        min_width = max(10, int(region_w * 0.10))   # curve must span ≥ 10% of plot
+
         valid_components = []
         for comp_id in range(1, n_components + 1):
             ys, xs = np.where(labelled == comp_id)
-            h_extent = xs.max() - xs.min() + 1
-            
+            n_px = len(ys)
+            if n_px < 5:
+                continue
+            h_extent = int(xs.max()) - int(xs.min()) + 1
+            v_extent = int(ys.max()) - int(ys.min()) + 1
+
             if h_extent < min_width:
                 continue
-            
-            # Also skip components that are essentially horizontal/vertical lines
-            # (reference line remnants): aspect ratio check
-            v_extent = ys.max() - ys.min() + 1
+
             aspect = h_extent / max(v_extent, 1)
-            
-            # Real curves are wider than tall but not extremely thin lines
-            # If component is as wide as 90%+ of plot and very thin (aspect > 50),
-            # it's likely a horizontal reference line remnant
+
+            # Skip full-width very thin horizontal lines (reference/axis remnants)
             if h_extent > region_w * 0.85 and aspect > 40:
                 continue
-            # If component is nearly full-height and very narrow, it's a vertical line
+            # Skip full-height very narrow vertical lines
             if v_extent > region_h * 0.85 and aspect < 0.03:
                 continue
-            
+
             mean_y = float(np.mean(ys))
-            valid_components.append((comp_id, mean_y))
-        
-        # ── Step 4: Sort by mean y-position (top-of-image first) ──
+            valid_components.append((comp_id, mean_y, n_px))
+
+        # ── Step 7: Sort by mean y-position (top-of-image first) ──
         valid_components.sort(key=lambda x: x[1])
-        
-        # Keep ALL valid components — the LLM may under-count curves.
-        # Shape / extent filters above are sufficient to weed out noise.
-        
-        # ── Step 5: Column-median thinning per component ──
+        logger.debug("grayscale extraction: %d valid curves after filtering", len(valid_components))
+
+        # ── Step 8: Column-median thinning per component ──
         result: Dict[int, List[Tuple[int, int]]] = {}
-        for idx, (comp_id, _) in enumerate(valid_components):
+        for idx, (comp_id, _, _) in enumerate(valid_components):
             ys, xs = np.where(labelled == comp_id)
-            
-            # Bucket by x-column
+
             col_buckets: Dict[int, List[int]] = {}
             for x_val, y_val in zip(xs, ys):
                 col_buckets.setdefault(int(x_val), []).append(int(y_val))
-            
+
             thinned = []
             for cx in sorted(col_buckets):
                 median_y = int(np.median(col_buckets[cx]))
-                # Map back from region coords to full-image coords
                 thinned.append((cx + p_left, median_y + p_top))
-            
+
             result[idx] = thinned
-        
+
+        _save_debug_image("gs_labelled", (labelled > 0).astype(np.uint8) * 255)
         return result
+
+    @staticmethod
+    def _otsu_threshold(gray: np.ndarray) -> int:
+        """Compute Otsu's threshold for a uint8 grayscale image.
+
+        Deterministic (no randomness), works identically on every machine
+        regardless of numpy/scipy version.
+        """
+        hist, _ = np.histogram(gray.ravel(), bins=256, range=(0, 256))
+        total = gray.size
+        sum_total = float(np.dot(np.arange(256), hist))
+
+        sum_bg = 0.0
+        weight_bg = 0
+        max_var = 0.0
+        best_t = 128
+
+        for t in range(256):
+            weight_bg += hist[t]
+            if weight_bg == 0:
+                continue
+            weight_fg = total - weight_bg
+            if weight_fg == 0:
+                break
+            sum_bg += t * hist[t]
+            mean_bg = sum_bg / weight_bg
+            mean_fg = (sum_total - sum_bg) / weight_fg
+            var_between = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+            if var_between > max_var:
+                max_var = var_between
+                best_t = t
+
+        # Clamp to reasonable range for chart images
+        return max(40, min(best_t, 200))
     
     def detect_plot_area(self, image: Image.Image, dark_threshold: int = 80,
                          line_ratio: float = 0.3) -> Tuple[int, int, int, int]:
