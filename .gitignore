@@ -31,8 +31,6 @@ build/
 # Output and input folders (except structure)
 output/*/
 !output/.gitkeep
-input/**/*
-!input/.gitkeep
 
 # Results cache
 *.json

@@ -986,9 +986,9 @@ class CurveDigitizer:
             coeffs = np.polyfit(X, y, degree)
             poly = np.poly1d(coeffs)
             
-            # Calculate fitted points
+            # Calculate fitted points (300 for smooth rendering)
             x_min, x_max = X.min(), X.max()
-            x_fit = np.linspace(x_min, x_max, 50)
+            x_fit = np.linspace(x_min, x_max, 300)
             y_fit = poly(x_fit)
             
             # Calculate R-squared
@@ -1364,7 +1364,10 @@ class CurveDigitizer:
                     
                     axis_coords = self.normalize_to_axis(pixels, width, height, plot_area)
                     cleaned_coords = self.clean_coordinates_local(axis_coords)
-                    fit_result = self.fit_spline_curve(cleaned_coords)
+                    # Polynomial fit for grayscale: performance curves are
+                    # inherently parabolic, so degree-2 gives a clean shape
+                    # without the subtle oscillations a spline can introduce.
+                    fit_result = self.fit_polynomial_curve(cleaned_coords, degree=2)
                     metrics = self.calculate_curve_metrics(cleaned_coords, fit_result)
                     
                     results['curves'][color_key] = {
