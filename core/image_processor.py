@@ -477,10 +477,14 @@ class CurveDigitizer:
         3. Adaptive Otsu threshold → binary mask of dark strokes.
         4. Morphological close (connect broken dashes / thin lines).
         5. Suppress horizontal/vertical grid lines (projection filter).
-        6. Connected-component labelling (8-connectivity).
-        7. Filter components by horizontal extent (real curves span the plot).
+        6. Column-scan tracker: for each column, find vertical runs of
+           dark pixels and track their centroids left-to-right.
+        7. Filter tracks by horizontal extent (real curves span the plot).
         8. Sort by mean y (topmost = index 0).
-        9. Column-median thinning for a 1-px skeleton per curve.
+
+        Column-scan tracking is superior to connected-component labelling
+        because it correctly separates curves that touch or cross each
+        other, which is common on real performance charts.
 
         This is robust to:
         - Different JPEG quality / compression artifacts across machines
@@ -522,8 +526,10 @@ class CurveDigitizer:
         # ── Step 2: Adaptive Otsu threshold ──
         threshold = self._otsu_threshold(gray)
         # We want dark-on-light: pixels darker than threshold → True
-        binary = gray < threshold
-        _save_debug_image("gs_binary", binary)
+        # Use <= and add a small margin to capture curves whose gray value
+        # sits right at the Otsu boundary (common with anti-aliased lines).
+        binary = gray <= min(threshold + 10, 200)
+        _save_debug_image("gs_binary", binary.astype(np.uint8) * 255)
 
         # ── Step 3: Morphological close to connect dashes / thin strokes ──
         close_kernel = np.ones((3, 5), dtype=bool)   # wider than tall → connect along x
@@ -538,65 +544,195 @@ class CurveDigitizer:
         col_fill = binary.sum(axis=0) / region_h
         grid_cols = col_fill > 0.75
         binary[:, grid_cols] = False
-        _save_debug_image("gs_after_grid_suppress", binary)
+        _save_debug_image("gs_after_grid_suppress", binary.astype(np.uint8) * 255)
 
         # Small opening to remove residual specks after grid removal
         open_kernel = np.ones((2, 2), dtype=bool)
         binary = binary_opening(binary, structure=open_kernel, iterations=1)
 
-        # ── Step 5: Connected components (8-connectivity) ──
-        structure_8 = np.ones((3, 3), dtype=int)
-        labelled, n_components = ndimage_label(binary, structure=structure_8)
-        logger.debug("grayscale extraction: %d components before filtering", n_components)
+        # ── Step 5: Column-scan curve tracker ──
+        # Instead of dilation + connected-component labelling (which merges
+        # touching curves into a single blob), scan each column individually
+        # and track vertical "runs" of dark pixels across the image width.
+        # This correctly separates curves even where they touch or cross.
+        from scipy.ndimage import binary_dilation
 
-        # ── Step 6: Filter by horizontal extent ──
-        min_width = max(10, int(region_w * 0.10))   # curve must span ≥ 10% of plot
-
-        valid_components = []
-        for comp_id in range(1, n_components + 1):
-            ys, xs = np.where(labelled == comp_id)
-            n_px = len(ys)
-            if n_px < 5:
+        # --- 5a: find dark-pixel runs in every column ---
+        RUN_GAP = max(3, int(region_h * 0.005))     # min vertical gap to split runs
+        column_runs: Dict[int, list] = {}            # x → [(centroid_y, run_top, run_bot), ...]
+        for x in range(region_w):
+            dark_y = np.where(binary[:, x])[0]
+            if len(dark_y) == 0:
                 continue
-            h_extent = int(xs.max()) - int(xs.min()) + 1
-            v_extent = int(ys.max()) - int(ys.min()) + 1
+            runs = []
+            start = dark_y[0]
+            for i in range(1, len(dark_y)):
+                if dark_y[i] - dark_y[i - 1] > RUN_GAP:
+                    runs.append((start, dark_y[i - 1]))
+                    start = dark_y[i]
+            runs.append((start, dark_y[-1]))
+            column_runs[x] = [(int((r[0] + r[1]) // 2), int(r[0]), int(r[1])) for r in runs]
 
-            if h_extent < min_width:
+        # --- 5b: slope-predicting nearest-neighbour tracker ---
+        # Each "track" accumulates (x, centroid_y) pairs for one curve.
+        # We predict the expected y in the next column using a short
+        # slope history, which prevents the tracker from jumping to an
+        # adjacent curve when two curves are close together.
+        MAX_Y_JUMP = max(8, int(region_h * 0.03))   # max prediction error (tight)
+        MAX_X_GAP  = max(20, int(region_w * 0.10))   # stale track threshold
+        SLOPE_WINDOW = 5  # columns for slope estimation
+
+        tracks: list = []          # list of lists: [[(x, cy), ...], ...]
+        track_last_x: list = []    # last-seen x for each track
+        track_last_y: list = []    # last-seen y for each track
+        track_slope: list = []     # estimated dy/dx for each track
+
+        def _estimate_slope(track_pts):
+            """Estimate local slope from last few points."""
+            if len(track_pts) < 2:
+                return 0.0
+            recent = track_pts[-SLOPE_WINDOW:]
+            if len(recent) < 2:
+                return 0.0
+            dx = recent[-1][0] - recent[0][0]
+            dy = recent[-1][1] - recent[0][1]
+            return dy / dx if dx != 0 else 0.0
+
+        for x in sorted(column_runs.keys()):
+            centroids = [r[0] for r in column_runs[x]]
+            if not tracks:
+                for cy in centroids:
+                    tracks.append([(x, cy)])
+                    track_last_x.append(x)
+                    track_last_y.append(cy)
+                    track_slope.append(0.0)
                 continue
 
-            aspect = h_extent / max(v_extent, 1)
+            # Build cost matrix using predicted y position
+            used_tracks: set = set()
+            used_cents: set = set()
+            pairs = []
+            for ci, cy in enumerate(centroids):
+                for ti in range(len(tracks)):
+                    x_gap = x - track_last_x[ti]
+                    if x_gap > MAX_X_GAP:
+                        continue
+                    # Predict where the track should be at column x
+                    predicted_y = track_last_y[ti] + track_slope[ti] * x_gap
+                    dist = abs(cy - predicted_y)
+                    if dist <= MAX_Y_JUMP:
+                        pairs.append((dist, ci, ti))
+            pairs.sort()  # best (smallest distance) first
 
-            # Skip full-width very thin horizontal lines (reference/axis remnants)
-            if h_extent > region_w * 0.85 and aspect > 40:
+            for dist, ci, ti in pairs:
+                if ci in used_cents or ti in used_tracks:
+                    continue
+                tracks[ti].append((x, centroids[ci]))
+                track_last_x[ti] = x
+                track_last_y[ti] = centroids[ci]
+                track_slope[ti] = _estimate_slope(tracks[ti])
+                used_cents.add(ci)
+                used_tracks.add(ti)
+
+            # Unmatched centroids → new tracks
+            for ci, cy in enumerate(centroids):
+                if ci not in used_cents:
+                    tracks.append([(x, cy)])
+                    track_last_x.append(x)
+                    track_last_y.append(cy)
+                    track_slope.append(0.0)
+
+        # --- 5c: post-track running-median smoothing ---
+        # Remove jumps: for each point, if its y deviates more than a
+        # threshold from the running median of its neighbours, drop it.
+        SMOOTH_HALF = 5   # half-window for running median
+        SMOOTH_THR  = max(6, int(region_h * 0.015))  # max deviation from local median
+        smoothed_tracks: list = []
+        for t in tracks:
+            if len(t) < SMOOTH_HALF * 2 + 1:
+                smoothed_tracks.append(t)
                 continue
-            # Skip full-height very narrow vertical lines
-            if v_extent > region_h * 0.85 and aspect < 0.03:
+            arr = np.array(t)
+            ys = arr[:, 1].astype(float)
+            keep = np.ones(len(ys), dtype=bool)
+            for i in range(len(ys)):
+                lo = max(0, i - SMOOTH_HALF)
+                hi = min(len(ys), i + SMOOTH_HALF + 1)
+                med = np.median(ys[lo:hi])
+                if abs(ys[i] - med) > SMOOTH_THR:
+                    keep[i] = False
+            cleaned = arr[keep]
+            if len(cleaned) >= 5:
+                smoothed_tracks.append([(int(p[0]), int(p[1])) for p in cleaned])
+            else:
+                smoothed_tracks.append(t)
+        tracks = smoothed_tracks
+
+        # --- 5c: filter tracks ---
+        min_track_width = max(10, int(region_w * 0.15))
+        valid_tracks = []
+        for t in tracks:
+            xs_t = [p[0] for p in t]
+            ys_t = [p[1] for p in t]
+            x_span = max(xs_t) - min(xs_t)
+            y_span = max(ys_t) - min(ys_t)
+
+            # (i) Too short horizontally
+            if x_span < min_track_width:
                 continue
 
-            mean_y = float(np.mean(ys))
-            valid_components.append((comp_id, mean_y, n_px))
+            # (ii) Steep / nearly-vertical lines (surge lines)
+            slope = y_span / max(x_span, 1)
+            if slope > 1.5:
+                continue
 
-        # ── Step 7: Sort by mean y-position (top-of-image first) ──
-        valid_components.sort(key=lambda x: x[1])
-        logger.debug("grayscale extraction: %d valid curves after filtering", len(valid_components))
+            # (iii) Dashed / dotted lines: low column coverage
+            unique_x = len(set(xs_t))
+            coverage = unique_x / max(x_span, 1)
+            if coverage < 0.50:
+                continue
 
-        # ── Step 8: Column-median thinning per component ──
+            valid_tracks.append(t)
+
+        # --- 5d: rank and limit to num_curves ---
+        # Score each track by (x_span * coverage) — prefer long, dense tracks.
+        # Keep at most num_curves tracks (the LLM-reported curve count).
+        def _track_score(t):
+            xs_t = [p[0] for p in t]
+            x_span = max(xs_t) - min(xs_t)
+            unique_x = len(set(xs_t))
+            return x_span * (unique_x / max(x_span, 1))
+
+        valid_tracks.sort(key=_track_score, reverse=True)
+        if len(valid_tracks) > num_curves:
+            valid_tracks = valid_tracks[:num_curves]
+
+        # Sort by mean y (topmost first)
+        valid_tracks.sort(key=lambda t: float(np.mean([p[1] for p in t])))
+        logger.debug("grayscale extraction: %d tracks after column-scan",
+                     len(valid_tracks))
+
+        _save_debug_image("gs_binary_final", binary.astype(np.uint8) * 255)
+
+        # ── Step 6: Convert tracked centroids to pixel coordinates ──
         result: Dict[int, List[Tuple[int, int]]] = {}
-        for idx, (comp_id, _, _) in enumerate(valid_components):
-            ys, xs = np.where(labelled == comp_id)
-
-            col_buckets: Dict[int, List[int]] = {}
-            for x_val, y_val in zip(xs, ys):
-                col_buckets.setdefault(int(x_val), []).append(int(y_val))
-
-            thinned = []
-            for cx in sorted(col_buckets):
-                median_y = int(np.median(col_buckets[cx]))
-                thinned.append((cx + p_left, median_y + p_top))
-
+        for idx, track in enumerate(valid_tracks):
+            # Each track point is (col_x, centroid_y) in region coords
+            # Convert to full-image pixel coords
+            thinned = [(x + p_left, y + p_top) for x, y in track]
             result[idx] = thinned
 
-        _save_debug_image("gs_labelled", (labelled > 0).astype(np.uint8) * 255)
+        # Debug: save colour-coded tracks
+        if _DEBUG_DIR:
+            _trk_img = np.zeros((*binary.shape, 3), dtype=np.uint8)
+            _trk_colors = [(255,0,0),(0,180,0),(0,0,255),(255,165,0),(128,0,255),(0,200,200)]
+            for i, track in enumerate(valid_tracks):
+                c = _trk_colors[i % len(_trk_colors)]
+                for tx, ty in track:
+                    if 0 <= ty < _trk_img.shape[0] and 0 <= tx < _trk_img.shape[1]:
+                        _trk_img[ty, tx] = c
+            _save_debug_image("gs_tracks", _trk_img)
+
         return result
 
     @staticmethod
@@ -880,6 +1016,50 @@ class CurveDigitizer:
         if len(cleaned) < len(arr) * 0.6:
             return coordinates
         return [tuple(p) for p in cleaned]
+
+    # ─────────────────────────────────────────────────────────────
+    #  Iterative sigma-clip (fit-based outlier rejection)
+    # ─────────────────────────────────────────────────────────────
+
+    def _iterative_sigma_clip(self, coordinates: List[Tuple[float, float]],
+                              degree: int = 2,
+                              sigma: float = 2.5,
+                              max_iter: int = 3) -> List[Tuple[float, float]]:
+        """Iteratively fit a polynomial and reject outliers.
+
+        Each round:
+        1. Fit polynomial of given *degree* to the remaining points.
+        2. Compute residuals.
+        3. Remove points whose |residual| > sigma * MAD(residuals).
+        4. Stop when no points are removed or *max_iter* reached.
+
+        Preserves at least 60 % of original points.
+        """
+        if len(coordinates) < degree + 2:
+            return coordinates
+
+        arr = np.array(sorted(coordinates, key=lambda p: p[0]))
+        for _ in range(max_iter):
+            xs, ys = arr[:, 0], arr[:, 1]
+            try:
+                coeffs = np.polyfit(xs, ys, degree)
+            except Exception:
+                break
+            poly = np.poly1d(coeffs)
+            residuals = np.abs(ys - poly(xs))
+            mad = np.median(residuals)
+            if mad < 1e-9:
+                break  # fit is already nearly perfect
+            threshold = sigma * mad
+            keep = residuals <= threshold
+            # Never drop below 40 % of the original input
+            if np.sum(keep) < len(coordinates) * 0.4:
+                break
+            if np.all(keep):
+                break  # nothing to remove
+            arr = arr[keep]
+
+        return [tuple(p) for p in arr]
 
     # ─────────────────────────────────────────────────────────────
     #  Cubic smoothing spline  (any curve shape)
@@ -1238,7 +1418,8 @@ class CurveDigitizer:
     
     def process_curve_image(self, image_path: str, features: List[Dict], 
                            output_dir: str = "./output/",
-                           crop_box: Optional[Tuple[int, int, int, int]] = None) -> Dict[str, Any]:
+                           crop_box: Optional[Tuple[int, int, int, int]] = None,
+                           mode: str = "auto") -> Dict[str, Any]:
         """
         Complete end-to-end processing of a curve image.
         
@@ -1246,6 +1427,7 @@ class CurveDigitizer:
             image_path: Path to image file
             features: Feature list from Gemini (curves with colors)
             crop_box: Optional crop coordinates
+            mode: 'auto' (detect), 'color', or 'grayscale'
             
         Returns:
             Dictionary with processed curves and fitted polynomials
@@ -1267,8 +1449,13 @@ class CurveDigitizer:
             'curves': {}
         }
         
-        # Auto-detect grayscale vs colour image
-        grayscale_mode = self.is_grayscale_image(image)
+        # Detect or force grayscale vs colour mode
+        if mode == "grayscale":
+            grayscale_mode = True
+        elif mode == "color":
+            grayscale_mode = False
+        else:
+            grayscale_mode = self.is_grayscale_image(image)
         results['grayscale_mode'] = bool(grayscale_mode)
         
         if grayscale_mode and 'curves' in features:
@@ -1346,30 +1533,56 @@ class CurveDigitizer:
                         new_features.append(cf_copy)
                     curve_features_sorted = new_features
 
-                for cluster_idx, pixels in gray_clusters.items():
-                    if cluster_idx < len(curve_features_sorted):
-                        cf = curve_features_sorted[cluster_idx]
-                        color_key = cf.get('color', f'gray_{cluster_idx}')
-                        label = cf.get('label', f'Curve {cluster_idx + 1}')
+                # ── Debug: save cluster visualisation ──
+                if _DEBUG_DIR:
+                    _dbg_cluster_img = np.array(image.convert("RGB")).copy()
+                    _dbg_colors = [(255,0,0),(0,180,0),(0,0,255),
+                                   (255,165,0),(128,0,255),(0,200,200)]
+                    for _ci, _pxs in sorted(gray_clusters.items()):
+                        _cc = _dbg_colors[_ci % len(_dbg_colors)]
+                        for _px, _py in _pxs:
+                            if 0 <= _py < _dbg_cluster_img.shape[0] and 0 <= _px < _dbg_cluster_img.shape[1]:
+                                _dbg_cluster_img[_py, _px] = _cc
+                    _save_debug_image("gs_clusters_overlay", _dbg_cluster_img)
+
+                # ── Fit each grayscale cluster using the SAME logic as colour path ──
+                # normalize_to_axis → clean_coordinates_local → fit_polynomial_curve(degree=2)
+                for curve_idx, pixels in sorted(gray_clusters.items()):
+                    if curve_idx < len(curve_features_sorted):
+                        cf = curve_features_sorted[curve_idx]
+                        label = cf.get('label', f'Curve {curve_idx + 1}')
                     else:
-                        color_key = f'gray_{cluster_idx}'
-                        label = f'Curve {cluster_idx + 1}'
-                    
+                        label = f'Curve {curve_idx + 1}'
+                    color_key = f'gray_{curve_idx}'
+
                     if len(pixels) < 2:
                         results['curves'][color_key] = {
                             'label': label, 'color': color_key,
-                            'error': f'Insufficient pixels in component {cluster_idx}'
+                            'extraction_mode': 'grayscale',
+                            'error': f'Insufficient pixels ({len(pixels)}) for curve {curve_idx}'
                         }
                         continue
-                    
+
+                    # Normalize pixel coords → axis coords (same as colour path)
                     axis_coords = self.normalize_to_axis(pixels, width, height, plot_area)
+
+                    # Clean with shape-preserving local filter (same as colour path)
                     cleaned_coords = self.clean_coordinates_local(axis_coords)
-                    # Polynomial fit for grayscale: performance curves are
-                    # inherently parabolic, so degree-2 gives a clean shape
-                    # without the subtle oscillations a spline can introduce.
+
+                    # Iterative sigma-clip: fit degree-2, remove 2.5σ outliers, re-fit.
+                    # This catches stray points that the tracker picked up from
+                    # adjacent curves (which local-MAD might miss because they
+                    # appear as a gradual drift rather than a sudden spike).
+                    cleaned_coords = self._iterative_sigma_clip(cleaned_coords,
+                                                                degree=2, sigma=2.0,
+                                                                max_iter=5)
+
+                    # Polynomial fit degree 2 — parabolic (same as colour path)
                     fit_result = self.fit_polynomial_curve(cleaned_coords, degree=2)
+
+                    # Quality metrics (same as colour path)
                     metrics = self.calculate_curve_metrics(cleaned_coords, fit_result)
-                    
+
                     results['curves'][color_key] = {
                         'label': label, 'color': color_key,
                         'extraction_mode': 'grayscale',
@@ -1378,8 +1591,34 @@ class CurveDigitizer:
                         'original_point_count': len(pixels),
                         'normalized_point_count': len(axis_coords),
                         'cleaned_point_count': len(cleaned_coords),
-                        'fit_result': fit_result, 'metrics': metrics
+                        'fit_result': fit_result,
+                        'metrics': metrics
                     }
+
+                # ── Debug: save fitted-curves overlay ──
+                if _DEBUG_DIR:
+                    try:
+                        _fig, _ax = plt.subplots(figsize=(10, 6))
+                        _ax.set_xlim(self.xMin, self.xMax)
+                        _ax.set_ylim(self.yMin, self.yMax)
+                        _fit_colors = ['red', 'green', 'blue',
+                                       'orange', 'purple', 'cyan']
+                        for _fi, (ck, cv) in enumerate(results['curves'].items()):
+                            fr = cv.get('fit_result', {})
+                            fp = fr.get('fitted_points', [])
+                            if fp:
+                                _ax.plot([p['x'] for p in fp],
+                                         [p['y'] for p in fp],
+                                         color=_fit_colors[_fi % len(_fit_colors)],
+                                         linewidth=2,
+                                         label=cv.get('label', ck))
+                        _ax.legend(fontsize=8)
+                        _ax.set_title("Grayscale: fitted curves")
+                        _dbg_path = Path(_DEBUG_DIR) / "gs_fitted_curves.png"
+                        _fig.savefig(str(_dbg_path), dpi=120)
+                        plt.close(_fig)
+                    except Exception:
+                        pass
         
         elif 'curves' in features:
             # ─── Colour path: dynamic RGB extraction ───
