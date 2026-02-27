@@ -165,15 +165,31 @@ def display_image_results(results: Dict[str, Any]) -> None:
     else:
         st.warning("No curves detected in the image.")
     
-    # ── Display the generated digitized output graph ──
+    # ── Toggleable overlay comparison at the bottom ──
     output_graphs = results.get('output_graphs', {})
-    if output_graphs:
-        st.subheader("📊 Reconstructed Digitized Curves")
-        for graph_name, graph_path in output_graphs.items():
-            import os
-            if os.path.exists(graph_path):
-                st.image(graph_path, caption=graph_name.replace('_', ' ').title(),
-                         use_container_width=True)
+    overlay_img = output_graphs.get('overlay', '')
+    if input_img and Path(input_img).exists() and overlay_img and Path(overlay_img).exists():
+        st.subheader("🔍 Overlay Comparison (click to toggle)")
+
+        # Session-state key to track which image is shown
+        toggle_key = "overlay_toggle"
+        if toggle_key not in st.session_state:
+            st.session_state[toggle_key] = "output"  # start with overlay
+
+        if st.button(
+            "Show Input Image" if st.session_state[toggle_key] == "output" else "Show Output Overlay",
+            key="overlay_toggle_btn",
+        ):
+            st.session_state[toggle_key] = (
+                "input" if st.session_state[toggle_key] == "output" else "output"
+            )
+
+        if st.session_state[toggle_key] == "output":
+            st.image(overlay_img, caption="Digitized Output (Overlay)",
+                     width=600)
+        else:
+            st.image(input_img, caption="Original Input",
+                     width=600)
 
     # Download results
     if results.get('output_file'):

@@ -1337,7 +1337,10 @@ class CurveDigitizer:
     def generate_digitized_graphs(self, results: Dict[str, Any], instance_dir: str, 
                                    timestamp: str) -> Dict[str, str]:
         """
-        Generate a combined digitized output graph from fitted polynomial curves.
+        Generate output images:
+        1. A standalone digitized chart with axis labels, legend and grid.
+        2. An overlay image with fitted curves drawn on the original image
+           (same pixel dimensions) for visual comparison.
         
         Args:
             results: Processing results dict with curves and fit data
@@ -1356,7 +1359,6 @@ class CurveDigitizer:
         
         x_label = f"{axis_info.get('xUnit', 'X')}"
         y_label = f"{axis_info.get('yUnit', 'Y')}"
-        description = axis_info.get('imageDescription', 'Performance Curve')
         
         # Map color names to matplotlib-compatible colors
         color_map = {
@@ -1372,16 +1374,14 @@ class CurveDigitizer:
                      '#9b59b6', '#00bcd4', '#795548', '#e91e63',
                      '#f1c40f', '#1a237e']
         
-        # ── Combined plot with all curves ──
+        # ═══════════════════════════════════════════════════════
+        # 1. Standalone digitized chart (axis coords, legend)
+        # ═══════════════════════════════════════════════════════
         fig, ax = plt.subplots(figsize=(10, 7))
         has_valid_curves = False
         
         for color_name, curve_data in curves_data.items():
             fit = curve_data.get('fit_result', {})
-            fitted_points = fit.get('fitted_points', [])
-            if not fitted_points:
-                continue
-            
             fitted_points = fit.get('fitted_points', [])
             if not fitted_points:
                 continue
@@ -1397,7 +1397,7 @@ class CurveDigitizer:
                 plot_color = _gs_cycle[ci % len(_gs_cycle)]
             
             ax.plot(x_vals, y_vals, color=plot_color, linewidth=2.5,
-                    label=f"{label_text} (R²={r_sq:.4f})")
+                    label=f"{label_text} (R\u00b2={r_sq:.4f})")
         
         if has_valid_curves:
             ax.set_xlabel(x_label, fontsize=12)
@@ -1413,6 +1413,63 @@ class CurveDigitizer:
             saved_graphs['all_curves'] = combined_path
         
         plt.close(fig)
+        
+        # ═══════════════════════════════════════════════════════
+        # 2. Overlay image (fitted curves on original, same dims)
+        # ═══════════════════════════════════════════════════════
+        image_path = results.get('image_path', '')
+        if has_valid_curves and image_path and Path(image_path).exists():
+            orig_img = np.array(Image.open(image_path).convert('RGB'))
+            img_h, img_w = orig_img.shape[:2]
+
+            pa = results.get('plot_area', {})
+            pa_left  = pa.get('left', 0)
+            pa_top   = pa.get('top', 0)
+            pa_right = pa.get('right', img_w)
+            pa_bot   = pa.get('bottom', img_h)
+
+            x_min, x_max = self.xMin, self.xMax
+            y_min, y_max = self.yMin, self.yMax
+            ax_w = x_max - x_min if x_max != x_min else 1.0
+            ax_h = y_max - y_min if y_max != y_min else 1.0
+
+            def ax2px_x(ax_x):
+                return pa_left + (ax_x - x_min) / ax_w * (pa_right - pa_left)
+
+            def ax2px_y(ax_y):
+                return pa_top + (y_max - ax_y) / ax_h * (pa_bot - pa_top)
+
+            dpi = 150
+            fig2, ax2 = plt.subplots(figsize=(img_w / dpi, img_h / dpi), dpi=dpi)
+            ax2.imshow(orig_img, extent=[0, img_w, img_h, 0], aspect='auto')
+
+            for color_name, curve_data in curves_data.items():
+                fit = curve_data.get('fit_result', {})
+                fitted_points = fit.get('fitted_points', [])
+                if not fitted_points:
+                    continue
+
+                px_x = [ax2px_x(p['x']) for p in fitted_points]
+                px_y = [ax2px_y(p['y']) for p in fitted_points]
+
+                plot_color = color_map.get(color_name.lower(), None)
+                if plot_color is None:
+                    ci = list(curves_data.keys()).index(color_name)
+                    plot_color = _gs_cycle[ci % len(_gs_cycle)]
+
+                ax2.plot(px_x, px_y, color=plot_color, linewidth=2)
+
+            ax2.set_xlim(0, img_w)
+            ax2.set_ylim(img_h, 0)
+            ax2.axis('off')
+            fig2.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+            overlay_path = str(instance_path / f"overlay_{timestamp}.png")
+            fig2.savefig(overlay_path, dpi=dpi, bbox_inches='tight',
+                         pad_inches=0)
+            saved_graphs['overlay'] = overlay_path
+
+            plt.close(fig2)
         
         return saved_graphs
     
