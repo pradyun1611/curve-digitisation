@@ -1,11 +1,17 @@
 """
 Result display module for Streamlit UI.
 
-Handles visualization of image processing results.
+Handles visualization of image processing results, including:
+- Input/output image comparisons
+- Per-curve metrics and coefficients
+- Debug overlays (skeleton, axes bounds, rejected components)
+- Export (JSON/CSV download buttons)
 """
 
 import streamlit as st
 import json
+import csv
+import io
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional
@@ -196,12 +202,243 @@ def display_image_results(results: Dict[str, Any]) -> None:
         with open(results['output_file'], 'r') as f:
             json_data = json.dumps(json.load(f), indent=2)
         
-        st.download_button(
-            label="📥 Download Results (JSON)",
-            data=json_data,
-            file_name=f"curves_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            mime="application/json"
-        )
+        col_dl1, col_dl2 = st.columns(2)
+        with col_dl1:
+            st.download_button(
+                label="📥 Download Results (JSON)",
+                data=json_data,
+                file_name=f"curves_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json"
+            )
+        with col_dl2:
+            # CSV export of curve data
+            csv_data = _build_csv_export(results)
+            if csv_data:
+                st.download_button(
+                    label="📥 Download Curves (CSV)",
+                    data=csv_data,
+                    file_name=f"curves_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                )
+
+    # ── Per-Curve Coordinate Export ──
+    _display_coordinate_export(results)
+
+    # ── Pipeline Info ──
+    detected_mode = results.get('detected_mode', '')
+    extraction_method = results.get('extraction_method', '')
+    if detected_mode or extraction_method:
+        st.subheader("🔧 Pipeline Info")
+        info_cols = st.columns(3)
+        with info_cols[0]:
+            st.write(f"**Mode:** {detected_mode}")
+        with info_cols[1]:
+            st.write(f"**Extraction:** {extraction_method or 'color'}")
+        with info_cols[2]:
+            st.write(f"**Grayscale:** {results.get('grayscale_mode', False)}")
+
+    # ── Validation warnings ──
+    validation = results.get('validation', {})
+    if validation:
+        warning_msg = validation.get('warning', '')
+        if warning_msg:
+            st.warning(f"⚠️ {warning_msg}")
+        with st.expander("📊 Mapping Validation", expanded=bool(warning_msg)):
+            v1, v2 = st.columns(2)
+            with v1:
+                st.write(f"**Data Y range:** "
+                         f"{validation.get('y_data_min', '?')} – "
+                         f"{validation.get('y_data_max', '?')}")
+            with v2:
+                st.write(f"**Axis Y range:** "
+                         f"{validation.get('y_axis_min', '?')} – "
+                         f"{validation.get('y_axis_max', '?')}")
+            st.write(f"**Y coverage:** {validation.get('y_coverage_pct', '?')}%")
+            pa_px = validation.get('plot_area_pixels', [])
+            if pa_px:
+                st.write(f"**Plot area (px):** L={pa_px[0]}, T={pa_px[1]}, "
+                         f"R={pa_px[2]}, B={pa_px[3]}")
+
+    # ── Debug Overlay (if enabled) ──
+    show_debug = False
+    if hasattr(st, 'session_state'):
+        settings = st.session_state.get("pipeline_settings", {})
+        show_debug = settings.get("show_debug", False)
+    
+    if show_debug:
+        _display_debug_overlay(results)
+
+
+def _display_coordinate_export(results: Dict[str, Any]) -> None:
+    """Per-curve coordinate lists with preview + per-curve CSV download."""
+    curves = results.get('curves', {})
+    if not curves:
+        return
+
+    st.subheader("📋 Coordinate Export (per curve)")
+
+    for color, curve_data in curves.items():
+        if not isinstance(curve_data, dict):
+            continue
+
+        label = curve_data.get('label', color)
+
+        # Gather available coordinate sources
+        fit = curve_data.get('fit_result', {}) or {}
+        fitted_pts = fit.get('fitted_points', [])
+        axis_coords = curve_data.get('axis_coords', [])
+        pixel_coords = curve_data.get('pixel_coords', [])
+
+        # Pick best source
+        if fitted_pts:
+            pts = [(pt['x'], pt['y']) for pt in fitted_pts]
+            source = 'fitted'
+        elif axis_coords:
+            pts = [(pt[0], pt[1]) for pt in axis_coords]
+            source = 'axis'
+        elif pixel_coords:
+            pts = [(pt[0], pt[1]) for pt in pixel_coords]
+            source = 'pixel'
+        else:
+            continue
+
+        with st.expander(f"🔹 {color.upper()} — {label}  ({len(pts)} pts, {source})", expanded=False):
+            # Preview first 10
+            preview = pts[:10]
+            header = "x,y" if source != 'pixel' else "px_x,px_y"
+            rows = [header] + [f"{x:.4f},{y:.4f}" for x, y in preview]
+            if len(pts) > 10:
+                rows.append(f"... ({len(pts) - 10} more)")
+            st.code("\n".join(rows), language="csv")
+
+            # Also show pixel coords if we have data coords
+            if source in ('fitted', 'axis') and pixel_coords:
+                st.caption(f"Raw pixel coordinates: {len(pixel_coords)} points")
+
+            # Per-curve CSV download
+            csv_buf = io.StringIO()
+            writer = csv.writer(csv_buf)
+            writer.writerow(['curve', 'label', 'source', 'x', 'y'])
+            for x, y in pts:
+                writer.writerow([color, label, source, round(x, 6), round(y, 6)])
+            # Append pixel coords as separate rows if available
+            if source != 'pixel' and pixel_coords:
+                for pt in pixel_coords:
+                    px, py = (pt[0], pt[1]) if isinstance(pt, (list, tuple)) else (pt.get('x', 0), pt.get('y', 0))
+                    writer.writerow([color, label, 'pixel', int(px), int(py)])
+
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            st.download_button(
+                label=f"📥 CSV — {label}",
+                data=csv_buf.getvalue(),
+                file_name=f"{color}_{ts}.csv",
+                mime="text/csv",
+                key=f"dl_csv_{color}_{ts}",
+            )
+
+            # Per-curve JSON download
+            json_payload = {
+                "curve": color,
+                "label": label,
+                "source": source,
+                "point_count": len(pts),
+                "data_points": [{"x": round(x, 6), "y": round(y, 6)} for x, y in pts],
+            }
+            if source != 'pixel' and pixel_coords:
+                json_payload["pixel_points"] = [
+                    {"x": int(pt[0] if isinstance(pt, (list, tuple)) else pt.get('x', 0)),
+                     "y": int(pt[1] if isinstance(pt, (list, tuple)) else pt.get('y', 0))}
+                    for pt in pixel_coords
+                ]
+            st.download_button(
+                label=f"📥 JSON — {label}",
+                data=json.dumps(json_payload, indent=2),
+                file_name=f"{color}_{ts}.json",
+                mime="application/json",
+                key=f"dl_json_{color}_{ts}",
+            )
+
+
+def _build_csv_export(results: Dict[str, Any]) -> Optional[str]:
+    """Build CSV string from extracted curve data."""
+    curves = results.get('curves', {})
+    if not curves:
+        return None
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # Header
+    writer.writerow(['curve', 'label', 'source', 'x', 'y'])
+    
+    for color, curve_data in curves.items():
+        if not isinstance(curve_data, dict):
+            continue
+        label = curve_data.get('label', color)
+        
+        # Prefer fitted_points (data coords)
+        fit = curve_data.get('fit_result', {})
+        fitted_pts = fit.get('fitted_points', []) if isinstance(fit, dict) else []
+        if fitted_pts:
+            for pt in fitted_pts:
+                writer.writerow([color, label, 'fitted', 
+                               round(pt['x'], 4), round(pt['y'], 4)])
+        else:
+            # Fallback to axis_coords or pixel_coords
+            axis_coords = curve_data.get('axis_coords', [])
+            if axis_coords:
+                for pt in axis_coords:
+                    writer.writerow([color, label, 'axis',
+                                   round(pt[0], 4), round(pt[1], 4)])
+            else:
+                pixel_coords = curve_data.get('pixel_coords', [])
+                for pt in pixel_coords:
+                    writer.writerow([color, label, 'pixel',
+                                   int(pt[0]), int(pt[1])])
+    
+    return output.getvalue()
+
+
+def _display_debug_overlay(results: Dict[str, Any]) -> None:
+    """Display debug information and overlays."""
+    st.subheader("🔍 Debug Overlay")
+    
+    # Plot area bounds
+    pa = results.get('plot_area', {})
+    if pa:
+        st.write(f"**Plot Area:** left={pa.get('left')}, top={pa.get('top')}, "
+                f"right={pa.get('right')}, bottom={pa.get('bottom')}")
+    
+    # Per-curve debug info
+    curves = results.get('curves', {})
+    for color, curve_data in curves.items():
+        if not isinstance(curve_data, dict):
+            continue
+        with st.expander(f"Debug: {color}", expanded=False):
+            st.write(f"**Extraction mode:** {curve_data.get('extraction_mode', 'color')}")
+            st.write(f"**Raw pixels:** {curve_data.get('original_point_count', 0)}")
+            st.write(f"**Cleaned:** {curve_data.get('cleaned_point_count', 0)}")
+            
+            # Plot area used for this curve
+            cpa = curve_data.get('plot_area', [])
+            if cpa:
+                st.write(f"**Curve plot_area:** {cpa}")
+            
+            # Fit info
+            fit = curve_data.get('fit_result', {})
+            if fit and isinstance(fit, dict):
+                st.write(f"**Fit degree:** {fit.get('degree', 'N/A')}")
+                st.write(f"**R²:** {fit.get('r_squared', 'N/A')}")
+                st.write(f"**Fitted points:** {len(fit.get('fitted_points', []))}")
+    
+    # Debug images from env var
+    import os
+    debug_dir = os.environ.get("CURVE_DEBUG_IMAGES", "")
+    if debug_dir and Path(debug_dir).exists():
+        st.write("**Debug images:**")
+        debug_files = sorted(Path(debug_dir).glob("*.png"))
+        for df in debug_files[:10]:
+            st.image(str(df), caption=df.name, width=400)
 
 
 def display_processing_summary(axis_info: Dict, features: Dict) -> str:

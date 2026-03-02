@@ -25,28 +25,65 @@ curve-digitisation/
 ├── core/                         # Core functionality modules
 │   ├── __init__.py              # Package initialization
 │   ├── openai_client.py         # OpenAI API client
-│   └── image_processor.py       # Image digitization and curve fitting
+│   ├── image_processor.py       # Image digitization and curve fitting
+│   ├── router.py                # Image-mode detection (color vs B/W)
+│   ├── bw_pipeline.py           # Skeleton-based B/W extraction pipeline
+│   ├── calibration.py           # Axis calibration & mapping (fixed)
+│   ├── pipeline.py              # End-to-end pipeline orchestration
+│   ├── scale.py                 # Affine mapping utilities
+│   ├── reconstruction.py        # Overlay / mask reconstruction
+│   ├── metrics.py               # Accuracy & self-consistency metrics
+│   ├── io_utils.py              # File I/O helpers
+│   └── types.py                 # Data classes (AxisInfo, CurveResult, …)
 │
 ├── ui/                          # User interface modules (Streamlit)
 │   ├── __init__.py              # Package initialization
-│   ├── sidebar.py               # Sidebar configuration
+│   ├── sidebar.py               # Sidebar with mode/calibration/anchor controls
+│   ├── click_canvas.py          # Click-to-place anchor canvas (interactive)
 │   ├── chat_interface.py        # Chat message display and history
-│   └── result_display.py        # Result visualization and metrics
+│   └── result_display.py        # Result visualization, coordinate export, debug
+│
+├── tests/                       # Unit & integration tests
+│   ├── test_router.py           # Image-mode classifier tests
+│   ├── test_calibration.py      # Axis calibration & mapping tests
+│   ├── test_bw_pipeline.py      # B/W skeleton pipeline tests
+│   ├── test_scale.py            # Affine mapping tests
+│   └── test_metrics.py          # Metrics tests
 │
 ├── input/                       # Input directory for images
-│   └── .gitkeep
-│
 ├── output/                      # Output directory for results
-│   └── .gitkeep
-│
 ├── requirements.txt             # Project dependencies
 ├── main.py                      # CLI chatbot entry point
 ├── streamlit_app.py             # Streamlit web UI entry point
-├── .gitignore                   # Git ignore rules
+├── api.py                       # FastAPI REST API
 └── README.md                    # This file
 ```
 
 ### Module Descriptions
+
+**core/router.py** – Image-mode detection
+- `classify_image_mode()`: HSV saturation-based classification → "color" or "bw"
+- Supports forced mode override or auto-detection
+- Thresholds: saturation mean, colorful pixel ratio, hue bin diversity
+
+**core/bw_pipeline.py** – Skeleton-based B/W extraction
+- `preprocess_bw()`: Crop, Otsu threshold, text removal, morphological close, skeletonize
+- `score_dashed()`: **Soft** score for dashed/dotted characteristics (0–1); no destructive deletion
+- `_compute_text_score()`: **Soft** score for text-like components (endpoint/branch density, compactness)
+- `extract_skeleton_components()`: Connected-component labelling of skeleton
+- `select_best_curves()`: Rank by `span × density × (1-dashed) × (1-text)`; soft thresholds
+- `trace_with_anchors()`: A* pathfinding with distance-transform cost + curvature penalty
+- `extend_curve_ends()`: Extrapolate endpoints using tangent-based ray search
+- `smooth_curve()`: Savitzky-Golay filter with configurable window length
+- `detect_plot_area_robust()`: Hough/projection-based plot-area bounding box
+- `extract_bw_curves()`: Full pipeline – iterative extract-mask-repeat for multi-curve
+
+**core/calibration.py** – Axis calibration (fixes mapping bug)
+- `calibrate_simple()`: Affine mapping using plot-area offsets (not full-image dims)
+- `calibrate_manual()`: User reference-point-based calibration
+- `pixel_to_data()` / `data_to_pixel()`: Batch coordinate transforms
+- `validate_calibration()`: Round-trip error measurement
+- `build_mapping_from_calibration()`: Convert to `MappingResult` for pipeline
 
 **core/openai_client.py**
 - `OpenAIClient`: OpenAI API wrapper class
@@ -57,7 +94,11 @@ curve-digitisation/
 - Methods: load_image, extract_color_pixels, normalize_to_axis, clean_coordinates_ransac, fit_polynomial_curve
 
 **ui/sidebar.py**
-- `setup_sidebar()`: Configures sidebar with API key input and settings
+- `setup_sidebar()`: Configures sidebar with API key input, mode selector, thresholds, anchors
+
+**ui/click_canvas.py** – Interactive anchor placement
+- `render_anchor_canvas()`: Click-on-image to place start/end anchors per curve
+- Per-curve cards: Add Curve → 📌 Pick Start → 📌 Pick End (click image) → auto-fills pipeline
 
 **ui/chat_interface.py**
 - `display_chat_message()`: Display single message
@@ -66,7 +107,76 @@ curve-digitisation/
 
 **ui/result_display.py**
 - `display_image_results()`: Visualize processing results
+- `_display_coordinate_export()`: Per-curve coordinate lists (pixel + data), CSV/JSON download
 - `display_processing_summary()`: Generate result summary text
+
+## B/W Scanned-Plot Pipeline
+
+When the router detects a grayscale/B&W image (or the user forces B&W mode), the following pipeline runs:
+
+1. **Plot area detection** – Finds the plot rectangle via horizontal/vertical line projections + tick-mark refinement.
+2. **Preprocessing** – Otsu threshold → morphological close → text/label removal → border axis removal.
+3. **Skeletonization** – Zhang-Suen thinning to 1-pixel-wide curves.
+4. **Distance transform** – Pre-computed EDT of the binary image used as tracing cost (prefer stroke centers).
+5. **Curve extraction** (one of two paths):
+   - **Anchor-guided tracing** – If the user supplies start/end pixel coords (via click canvas or sidebar), A* pathfinding traces through the skeleton using distance-transform cost + curvature penalty. One path per anchor pair.
+   - **Iterative auto-extraction** – Extract skeleton components → soft-score for text/dashed → pick the best one → mask its pixels from skeleton → repeat until *target_curves* are found. This prevents two curves from sharing pixels.
+6. **Soft rejection** – Components are **scored** for dashed-ness and text-likeness (0–1) and **down-ranked**, never destructively deleted. Thresholds (default 0.45 dashed, 0.50 text) are tunable via sidebar sliders.
+7. **Endpoint extension** – Extrapolates curve ends toward the plot boundary using tangent-based ray search.
+8. **Savitzky-Golay smoothing** – Configurable window length for post-extraction noise reduction.
+9. **Calibrated axis mapping** – Uses plot-area-relative affine (not full-image dims) to map pixel → data coordinates.
+
+### How to Use (B/W Workflow)
+
+1. **Upload** your chart image (PNG, JPG).
+2. **Expand** the "📍 Click-to-Place Anchors" section below the uploader.
+3. Click **➕ Add Curve** for each curve you want to trace.
+4. Click **📌 Start**, then click on the chart where the curve begins.
+5. Click **📌 End**, then click on the chart where the curve ends.
+6. Type a message (e.g. "digitize") and press **Send**.
+7. Review results under **Latest Results** — per-curve metrics, overlay comparison, coordinate export.
+8. Download coordinates: expand any curve under **📋 Coordinate Export** and click the CSV or JSON button.
+
+### UI Sidebar Controls
+
+| Control | Section | Description |
+|---------|---------|-------------|
+| Image Mode | Processing | Auto / Colored / B&W |
+| Ignore dashed lines | B/W Options | Soft-reject dashed/dotted (down-ranked, not deleted) |
+| Smoothing strength | B/W Options | Savitzky-Golay window (0 = auto) |
+| Use skeleton extraction | B/W Options | Skeleton vs. legacy column-scan |
+| Target curves | B/W Options | Force N curves (0 = auto-detect from LLM) |
+| Dashed threshold | B/W Thresholds | Components scored > threshold are rejected (0.45 default) |
+| Text threshold | B/W Thresholds | Components scored > threshold are rejected (0.50 default) |
+| Axis overrides | Axis Calibration | xMin, xMax, yMin, yMax number inputs |
+| Plot Area Override | Axis Calibration | Manual pixel bounds (left, top, right, bottom) |
+| Click-to-Place Anchors | Main Area | Interactive image canvas for placing start/end per curve |
+| Anchor start/end | Anchor Points | Pixel coordinates (sidebar fallback for manual entry) |
+| Debug overlay | Debug | Show skeleton, plot area, component info |
+
+### Exports
+
+Both JSON and CSV downloads are available at two levels:
+
+**Bulk export** (all curves):
+- **JSON** – Full result including curves, fit coefficients, pixel coords, axis coords, pipeline settings metadata.
+- **CSV** – Simple tabular format: `curve, label, source, x, y` for each extracted point.
+
+**Per-curve export** (under "📋 Coordinate Export"):
+- Expandable card per curve showing first 10 data points preview.
+- Download **CSV** or **JSON** per curve — includes both data-space and pixel-space coordinates.
+- JSON includes `data_points`, `pixel_points`, `label`, `source`, `point_count`.
+
+### Mapping Bug Fix
+
+The previous mapping used full image dimensions `(img_w, img_h)` when computing the affine transform, but pixel coordinates from `normalize_to_axis()` are **relative to the plot area**. The new `calibration.py` module computes:
+
+```
+data_x = x_min + (px - plot_left) / plot_width × (x_max - x_min)
+data_y = y_max - (py - plot_top)  / plot_height × (y_max - y_min)
+```
+
+This correctly handles: (a) plot area offset from image edges, (b) y-axis inversion (pixel y grows downward, data y grows upward).
 
 ## Installation
 

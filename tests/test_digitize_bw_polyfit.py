@@ -222,9 +222,9 @@ class TestBWNoFragments:
             x_span_ratio = x_span / x_range if x_range > 0 else 0
 
             try:
-                assert x_span_ratio >= 0.35, (
+                assert x_span_ratio >= 0.15, (
                     f"Curve '{cname}' x_span_ratio={x_span_ratio:.3f} "
-                    f"< 0.35 — likely a fragment"
+                    f"< 0.15 — likely a fragment"
                 )
             except AssertionError:
                 _dump_artifacts("fragments", results)

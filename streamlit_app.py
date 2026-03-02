@@ -24,6 +24,7 @@ from core.image_processor import CurveDigitizer
 from ui.sidebar import setup_sidebar
 from ui.chat_interface import display_chat_message, display_chat_history, initialize_session_state
 from ui.result_display import display_image_results, display_processing_summary
+from ui.click_canvas import render_anchor_canvas
 
 
 
@@ -122,6 +123,14 @@ def process_image(client: OpenAIClient, image_file, user_query: str, output_dir:
         with st.spinner("Extracting axis information..."):
             axis_info = client.extract_axis_info(image_base64, user_query)
         
+        # Apply calibration overrides from sidebar
+        settings = st.session_state.get("pipeline_settings", {})
+        cal_overrides = settings.get("calibration_overrides", {})
+        if cal_overrides:
+            for k, v in cal_overrides.items():
+                if v is not None:
+                    axis_info[k] = v
+        
         # Extract curve features
         with st.spinner("Detecting curves..."):
             features = client.extract_curve_features(image_base64)
@@ -129,14 +138,47 @@ def process_image(client: OpenAIClient, image_file, user_query: str, output_dir:
         # Digitize curves and generate graphs
         with st.spinner("Fitting polynomial curves and generating graphs..."):
             digitizer = CurveDigitizer(axis_info)
-            results = digitizer.process_curve_image(temp_path, features, output_dir)
+            
+            # Get pipeline settings from sidebar
+            mode = settings.get("mode", "auto")
+            ignore_dashed = settings.get("ignore_dashed", True)
+            smoothing_strength = settings.get("smoothing_strength", 0)
+            use_skeleton = settings.get("use_skeleton", True)
+            anchors = settings.get("anchors", None)
+            target_curves = settings.get("target_curves", 0)
+            dashed_threshold = settings.get("dashed_threshold", 0.45)
+            text_threshold = settings.get("text_threshold", 0.50)
+            plot_area_override = settings.get("plot_area_override", None)
+            
+            results = digitizer.process_curve_image(
+                temp_path, features, output_dir,
+                mode=mode,
+                anchors=anchors,
+                ignore_dashed=ignore_dashed,
+                smoothing_strength=smoothing_strength,
+                use_skeleton_bw=use_skeleton,
+                target_curves=target_curves,
+                dashed_threshold=dashed_threshold,
+                text_threshold=text_threshold,
+                plot_area_override=plot_area_override,
+            )
         
+        # Attach pipeline settings metadata for export provenance
+        results['pipeline_settings'] = {
+            'mode': mode,
+            'ignore_dashed': ignore_dashed,
+            'smoothing_strength': smoothing_strength,
+            'use_skeleton': use_skeleton,
+            'calibration_overrides': cal_overrides or {},
+            'version': '2.0',
+        }
+
         # Save JSON results in the per-instance output folder
         instance_dir = Path(results.get('instance_dir', output_dir))
         output_file = instance_dir / "curve_digitization.json"
         
         with open(output_file, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(results, f, indent=2, default=str)
         
         results['output_file'] = str(output_file)
         
@@ -204,6 +246,17 @@ def main():
         type=['png', 'jpg', 'jpeg', 'bmp', 'gif'],
         key="image_uploader"
     )
+
+    # ── Click-to-place anchor canvas ──
+    if uploaded_file is not None:
+        with st.expander("📍 Click-to-Place Anchors (B/W)", expanded=False):
+            st.caption(
+                "Add curves below, then click 📌 Start / 📌 End and click "
+                "on the image to place anchor points.  Anchors are sent to "
+                "the pipeline automatically when you press **Send**."
+            )
+            anchor_pairs = render_anchor_canvas(uploaded_file.getvalue())
+            uploaded_file.seek(0)  # reset after reading
     
     # Process user input
     if send_button and user_input:

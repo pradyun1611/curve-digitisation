@@ -24,6 +24,9 @@ matplotlib.use('Agg')  # Non-interactive backend for server/headless use
 import matplotlib.pyplot as plt
 from datetime import datetime
 
+from core.router import classify_image_mode
+from core.bw_pipeline import extract_bw_curves, smooth_curve
+
 # ── Determinism: single-threaded BLAS/LAPACK ──────────────────────
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -768,6 +771,91 @@ class CurveDigitizer:
 
         # Clamp to reasonable range for chart images
         return max(40, min(best_t, 200))
+
+    def _refine_plot_area_with_ticks(
+        self,
+        image: Image.Image,
+        plot_area: Tuple[int, int, int, int],
+    ) -> Tuple[int, int, int, int]:
+        """Refine plot-area top/bottom using y-axis tick marks.
+
+        Tick marks are short horizontal dashes that protrude from the
+        y-axis line.  Their y-positions correspond to labelled axis
+        values, so the span from the first to the last tick mark gives a
+        more accurate effective plot height than the rough line-based
+        detection.
+
+        Only adjusts top/bottom boundaries; left/right are usually
+        already accurate from vertical-line detection.
+        """
+        img_array = np.array(image)
+        if img_array.ndim == 3:
+            gray = np.mean(img_array[:, :, :3], axis=2)
+        else:
+            gray = img_array.astype(float)
+
+        height, width = gray.shape
+        p_left, p_top, p_right, p_bottom = plot_area
+
+        # Examine column strip just LEFT of axis line
+        tick_strip_w = min(20, p_left)
+        strip_left = max(0, p_left - tick_strip_w)
+        strip_right = p_left + 2  # include axis edge
+        if strip_right <= strip_left:
+            return plot_area
+
+        strip = gray[:, strip_left:strip_right]
+        dark_threshold = 100
+        dark_per_row = np.sum(strip < dark_threshold, axis=1)
+
+        # Axis line itself is dark in almost every row within the plot.
+        # Tick marks add EXTRA dark pixels in their rows.
+        # Strategy: within the rough [p_top, p_bottom] region, find rows
+        # with above-median dark pixel count (tick marks stick out).
+        region_dark = dark_per_row[p_top:p_bottom]
+        if len(region_dark) == 0:
+            return plot_area
+
+        median_dark = float(np.median(region_dark))
+        tick_threshold = median_dark + max(1, median_dark * 0.3)
+
+        tick_rows_rel = np.where(region_dark >= tick_threshold)[0]
+        if len(tick_rows_rel) < 2:
+            return plot_area
+
+        # Cluster adjacent rows (thick ticks span 2-4 rows)
+        clusters: list = []
+        cur = [tick_rows_rel[0]]
+        for i in range(1, len(tick_rows_rel)):
+            if tick_rows_rel[i] - tick_rows_rel[i - 1] <= 3:
+                cur.append(tick_rows_rel[i])
+            else:
+                clusters.append(cur)
+                cur = [tick_rows_rel[i]]
+        clusters.append(cur)
+
+        if len(clusters) < 2:
+            return plot_area
+
+        # Centers of first and last tick cluster
+        first_tick_y = int(np.mean(clusters[0])) + p_top
+        last_tick_y = int(np.mean(clusters[-1])) + p_top
+
+        # Only refine if tick span is reasonable (>30% of current height)
+        tick_span = last_tick_y - first_tick_y
+        current_height = p_bottom - p_top
+        if tick_span < current_height * 0.3:
+            return plot_area
+
+        # Use tick marks as refined top/bottom
+        refined_top = first_tick_y
+        refined_bottom = last_tick_y
+
+        # Sanity: don't expand beyond current bounds significantly
+        if refined_top >= p_top - 10 and refined_bottom <= p_bottom + 10:
+            return (p_left, refined_top, p_right, refined_bottom)
+
+        return plot_area
     
     def detect_plot_area(self, image: Image.Image, dark_threshold: int = 80,
                          line_ratio: float = 0.3) -> Tuple[int, int, int, int]:
@@ -1476,7 +1564,17 @@ class CurveDigitizer:
     def process_curve_image(self, image_path: str, features: List[Dict], 
                            output_dir: str = "./output/",
                            crop_box: Optional[Tuple[int, int, int, int]] = None,
-                           mode: str = "auto") -> Dict[str, Any]:
+                           mode: str = "auto",
+                           *,
+                           anchors: Optional[List[Any]] = None,
+                           ignore_dashed: bool = True,
+                           smoothing_strength: int = 0,
+                           use_skeleton_bw: bool = True,
+                           target_curves: int = 0,
+                           dashed_threshold: float = 0.45,
+                           text_threshold: float = 0.50,
+                           plot_area_override: Optional[Tuple[int, int, int, int]] = None,
+                           ) -> Dict[str, Any]:
         """
         Complete end-to-end processing of a curve image.
         
@@ -1484,7 +1582,17 @@ class CurveDigitizer:
             image_path: Path to image file
             features: Feature list from Gemini (curves with colors)
             crop_box: Optional crop coordinates
-            mode: 'auto' (detect), 'color', or 'grayscale'
+            mode: 'auto' (detect), 'color', 'grayscale', or 'bw'
+            anchors: Optional list of ((start_x, start_y), (end_x, end_y))
+                     for anchor-guided B/W tracing
+            ignore_dashed: Whether to reject dashed/dotted lines (B/W only)
+            smoothing_strength: Savitzky-Golay window for B/W smoothing (0=auto)
+            use_skeleton_bw: If True, use new skeleton-based B/W pipeline;
+                             if False, use legacy column-scan pipeline.
+            target_curves: Override curve count (0 = auto-detect).
+            dashed_threshold: Threshold for dashed line rejection.
+            text_threshold: Threshold for text component rejection.
+            plot_area_override: Manual pixel bounds (left, top, right, bottom).
             
         Returns:
             Dictionary with processed curves and fitted polynomials
@@ -1495,7 +1603,12 @@ class CurveDigitizer:
         width, height = image.size
         
         # Detect actual plot area boundaries for accurate coordinate mapping
-        plot_area = self.detect_plot_area(image)
+        if plot_area_override:
+            plot_area = plot_area_override
+        else:
+            plot_area = self.detect_plot_area(image)
+            # Refine with tick-mark detection for more accurate y-mapping
+            plot_area = self._refine_plot_area_with_ticks(image, plot_area)
         
         results = {
             'image_path': image_path,
@@ -1506,17 +1619,17 @@ class CurveDigitizer:
             'curves': {}
         }
         
-        # Detect or force grayscale vs colour mode
-        if mode == "grayscale":
-            grayscale_mode = True
-        elif mode == "color":
-            grayscale_mode = False
-        else:
-            grayscale_mode = self.is_grayscale_image(image)
+        # --- Mode Router: HSV-based auto-detection ---
+        # Map legacy mode names for backward compatibility
+        mode_map = {'grayscale': 'bw', 'color': 'color', 'auto': 'auto'}
+        router_mode = mode_map.get(mode, mode)
+        detected_mode = classify_image_mode(image, mode_override=router_mode)
+        grayscale_mode = (detected_mode == 'bw')
         results['grayscale_mode'] = bool(grayscale_mode)
+        results['detected_mode'] = detected_mode
         
         if grayscale_mode and 'curves' in features:
-            # ─── Grayscale path: connected-component extraction ───
+            # ─── Grayscale path ───
             # Filter GPT features: remove surge/reference/axis entries
             import re as _re
             _NON_CURVE_KW = {'surge', 'axis', 'boundary', 'limit',
@@ -1530,10 +1643,30 @@ class CurveDigitizer:
             ]
             
             num_curves = len(curve_features)
+            # If user explicitly set target_curves in sidebar, prefer that
+            if target_curves > 0:
+                num_curves = target_curves
             if num_curves > 0:
-                gray_clusters = self.extract_curves_grayscale(
-                    image, num_curves, plot_area
-                )
+                # Choose B/W extraction method
+                if use_skeleton_bw:
+                    # ── NEW: skeleton-based extraction with dashed rejection,
+                    #    anchor tracing, endpoint extension, and smoothing ──
+                    gray_clusters = extract_bw_curves(
+                        image, num_curves, plot_area,
+                        anchors=anchors,
+                        ignore_dashed=ignore_dashed,
+                        dashed_threshold=dashed_threshold,
+                        text_threshold=text_threshold,
+                        smoothing_strength=smoothing_strength,
+                        extend_ends=True,
+                    )
+                    results['extraction_method'] = 'skeleton'
+                else:
+                    # ── LEGACY: column-scan tracker ──
+                    gray_clusters = self.extract_curves_grayscale(
+                        image, num_curves, plot_area
+                    )
+                    results['extraction_method'] = 'column_scan'
                 
                 # ── Sort labels to match spatial cluster order ──
                 # Clusters are sorted top-first (smallest y-pixel).
@@ -1676,6 +1809,40 @@ class CurveDigitizer:
                         plt.close(_fig)
                     except Exception:
                         pass
+
+                # ──── Self-validation: y-range consistency check ────
+                all_fitted_y = []
+                for ck, cv in results['curves'].items():
+                    fr = cv.get('fit_result', {})
+                    fp = fr.get('fitted_points', [])
+                    all_fitted_y.extend([p['y'] for p in fp])
+
+                if all_fitted_y:
+                    y_data_min = min(all_fitted_y)
+                    y_data_max = max(all_fitted_y)
+                    y_axis_range = self.yMax - self.yMin
+                    y_data_range = y_data_max - y_data_min
+
+                    results['validation'] = {
+                        'y_data_min': round(y_data_min, 4),
+                        'y_data_max': round(y_data_max, 4),
+                        'y_axis_min': self.yMin,
+                        'y_axis_max': self.yMax,
+                        'y_coverage_pct': round(
+                            y_data_range / max(y_axis_range, 1e-9) * 100, 1
+                        ),
+                        'plot_area_pixels': list(plot_area),
+                    }
+
+                    # Warn if data occupies less than 20% of axis range
+                    if y_axis_range > 0 and y_data_range < y_axis_range * 0.20:
+                        results['validation']['warning'] = (
+                            f"Data y-range ({y_data_min:.1f}–{y_data_max:.1f}) "
+                            f"covers only {y_data_range/y_axis_range*100:.0f}% "
+                            f"of axis range ({self.yMin}–{self.yMax}). "
+                            "Plot area detection may be inaccurate; "
+                            "consider using Plot Area Override."
+                        )
         
         elif 'curves' in features:
             # ─── Colour path: dynamic RGB extraction ───

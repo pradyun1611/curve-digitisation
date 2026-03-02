@@ -32,6 +32,12 @@ from core.reconstruction import (
     render_reconstructed_plot,
 )
 from core.scale import compute_affine_mapping, roundtrip_error
+from core.calibration import (
+    calibrate_from_axis_info,
+    build_mapping_from_calibration,
+    pixel_to_data as calib_pixel_to_data,
+    validate_calibration,
+)
 from core.types import (
     AxisInfo,
     CurveResult,
@@ -98,30 +104,53 @@ def run_pipeline(
     logger.info("[%s] pipeline: image dimensions %dx%d", job_id, img_w, img_h)
 
     # ------------------------------------------------------------------
-    # 2. Compute affine mapping
+    # 2. Compute affine mapping  (FIX: use plot-area, not full image)
     # ------------------------------------------------------------------
     axis_info = AxisInfo.from_dict(axis_info_dict)
     has_mapping = axis_info.has_mapping
     mapping_status = "mapped" if has_mapping else "pixel_only"
 
+    # Extract plot area from digitizer results (critical for correct mapping)
+    pa = raw_results.get("plot_area", {})
+    pa_left = pa.get("left", 0)
+    pa_top = pa.get("top", 0)
+    pa_right = pa.get("right", img_w)
+    pa_bottom = pa.get("bottom", img_h)
+    plot_area_tuple = (pa_left, pa_top, pa_right, pa_bottom)
+    plot_w = pa_right - pa_left
+    plot_h = pa_bottom - pa_top
+
     mapping: Optional[MappingResult] = None
     debug_info: Dict[str, Any] = {
-        "plot_area_width": img_w,
-        "plot_area_height": img_h,
+        "image_width": img_w,
+        "image_height": img_h,
+        "plot_area": {"left": pa_left, "top": pa_top,
+                      "right": pa_right, "bottom": pa_bottom},
+        "plot_area_width": plot_w,
+        "plot_area_height": plot_h,
         "has_mapping": has_mapping,
     }
 
     if has_mapping:
-        mapping = compute_affine_mapping(axis_info, img_w, img_h, job_id=job_id)
+        # Use calibration system for correct plot-area-aware mapping
+        calibration = calibrate_from_axis_info(
+            axis_info, plot_area_tuple, method="simple",
+        )
+        mapping = build_mapping_from_calibration(calibration)
+
         debug_info["pixel_to_data_matrix"] = mapping.pixel_to_data_matrix
         debug_info["data_to_pixel_matrix"] = mapping.data_to_pixel_matrix
         debug_info["x_direction"] = mapping.x_direction
         debug_info["y_direction"] = mapping.y_direction
         debug_info["mapping_frame"] = mapping.frame
+        debug_info["calibration_method"] = calibration.method
 
         logger.info(
-            "[%s] pipeline: mapping matrices stored  p2d=%s  d2p=%s",
-            job_id, mapping.pixel_to_data_matrix, mapping.data_to_pixel_matrix,
+            "[%s] pipeline: mapping using plot_area (%d,%d,%d,%d) → "
+            "plot_dims=%dx%d  p2d=%s  d2p=%s",
+            job_id, pa_left, pa_top, pa_right, pa_bottom,
+            plot_w, plot_h,
+            mapping.pixel_to_data_matrix, mapping.data_to_pixel_matrix,
         )
 
         # Round-trip consistency check on all pixel coords
@@ -134,7 +163,9 @@ def run_pipeline(
                 logger.debug("[%s] pipeline: curve '%s' contributed %d pts for round-trip check",
                              job_id, cname, len(pts))
         if all_px:
-            rt_mean, rt_p95 = roundtrip_error(all_px, mapping)
+            # Validate using calibration round-trip
+            calib_pts = [(p[0], p[1]) for p in all_px]
+            rt_mean, rt_p95 = validate_calibration(calib_pts, calibration)
             mapping.mapping_roundtrip_error_mean_px = rt_mean
             mapping.mapping_roundtrip_error_p95_px = rt_p95
             debug_info["mapping_roundtrip_error_mean_px"] = rt_mean
@@ -331,7 +362,11 @@ def _enrich_pixel_coords(
     image_path: str,
     features_dict: Dict[str, Any],
 ) -> None:
-    """Add ``pixel_coords``, ``raw_pixel_points``, and ``axis_coords`` to raw curve dicts."""
+    """Add ``pixel_coords``, ``raw_pixel_points``, and ``axis_coords`` to raw curve dicts.
+
+    FIX: now passes plot_area to normalize_to_axis so pixel→data
+    mapping uses the correct coordinate frame.
+    """
     from PIL import Image as PILImage
 
     try:
@@ -340,6 +375,15 @@ def _enrich_pixel_coords(
         return
 
     width, height = img.size
+
+    # Get plot_area from results (set by process_curve_image)
+    pa = raw_results.get("plot_area", {})
+    if isinstance(pa, dict) and pa:
+        plot_area = (pa.get("left", 0), pa.get("top", 0),
+                     pa.get("right", width), pa.get("bottom", height))
+    else:
+        plot_area = None
+
     for color_key, cdata in raw_results.get("curves", {}).items():
         if not isinstance(cdata, dict):
             continue
@@ -364,10 +408,16 @@ def _enrich_pixel_coords(
                 sorted_pts = sorted_pts[::step]
             cdata["pixel_coords"] = sorted_pts
 
-        # --- axis_coords ---
+        # --- axis_coords  (FIX: pass plot_area for correct mapping) ---
         if "axis_coords" not in cdata and cdata.get("pixel_coords"):
             pxs = [(p[0], p[1]) for p in cdata["pixel_coords"]]
-            axis = digitizer.normalize_to_axis(pxs, width, height)
+            # Use per-curve plot_area if stored, else global
+            curve_pa = cdata.get("plot_area")
+            if curve_pa and isinstance(curve_pa, (list, tuple)) and len(curve_pa) == 4:
+                pa_tuple = tuple(curve_pa)
+            else:
+                pa_tuple = plot_area
+            axis = digitizer.normalize_to_axis(pxs, width, height, pa_tuple)
             if len(axis) > 500:
                 step = max(1, len(axis) // 500)
                 axis = axis[::step]
