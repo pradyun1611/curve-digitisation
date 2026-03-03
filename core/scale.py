@@ -53,12 +53,11 @@ def compute_affine_mapping(
     y_max = float(axis_info.yMax)  # type: ignore[arg-type]
 
     # Scale factors  ------------------------------------------------
-    # pixel x: 0 → plot_width   maps to  data x: x_min → x_max
-    sx = (x_max - x_min) / max(plot_width, 1)
-    # pixel y: 0 (top) → plot_height (bottom)  maps to  data y: y_max → y_min
-    # so  data_y = y_max - (py / plot_height) * (y_max - y_min)
-    #            = -sy * py + y_max          where sy = (y_max - y_min)/plot_height
-    sy_abs = (y_max - y_min) / max(plot_height, 1)
+    # Fence-post mapping: pixel 0 → xMin, pixel (plot_width-1) → xMax.
+    # Number of intervals = plot_width - 1.
+    sx = (x_max - x_min) / max(plot_width - 1, 1)
+    # pixel y: 0 (top) → yMax, (plot_height-1) (bottom) → yMin.
+    sy_abs = (y_max - y_min) / max(plot_height - 1, 1)
 
     # pixel→data  (2×3)
     # data_x =  sx * px + x_min

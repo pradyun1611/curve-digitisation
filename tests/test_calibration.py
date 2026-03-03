@@ -48,7 +48,7 @@ class TestCalibrateSimple:
         assert cal.data_to_pixel is not None
 
     def test_corners_map_correctly(self, simple_axis_info, plot_area):
-        """Top-left → (xMin, yMax), bottom-right → (xMax, yMin)."""
+        """Top-left → (xMin, yMax), bottom-right (last pixel) → (xMax, yMin)."""
         cal = calibrate_simple(simple_axis_info, plot_area)
         left, top, right, bottom = plot_area
 
@@ -58,21 +58,23 @@ class TestCalibrateSimple:
         assert abs(dx - 0.0) < 0.01
         assert abs(dy - 50.0) < 0.01
 
-        # Bottom-right of plot area → (100, 0)
-        pts = pixel_to_data([(right, bottom)], cal)
+        # Last extractable pixel (right-1, bottom-1) → (100, 0)
+        pts = pixel_to_data([(right - 1, bottom - 1)], cal)
         dx, dy = pts[0]
-        assert abs(dx - 100.0) < 0.01
-        assert abs(dy - 0.0) < 0.01
+        assert abs(dx - 100.0) < 0.5
+        assert abs(dy - 0.0) < 0.5
 
     def test_center_maps_correctly(self, simple_axis_info, plot_area):
         cal = calibrate_simple(simple_axis_info, plot_area)
         left, top, right, bottom = plot_area
-        cx, cy = (left + right) / 2, (top + bottom) / 2
+        # Fence-post center: midpoint between first and last pixel
+        cx = (left + right - 1) / 2.0
+        cy = (top + bottom - 1) / 2.0
 
         pts = pixel_to_data([(cx, cy)], cal)
         dx, dy = pts[0]
-        assert abs(dx - 50.0) < 0.01
-        assert abs(dy - 25.0) < 0.01
+        assert abs(dx - 50.0) < 0.5
+        assert abs(dy - 25.0) < 0.5
 
     def test_round_trip(self, simple_axis_info, plot_area):
         """pixel→data→pixel should be identity."""

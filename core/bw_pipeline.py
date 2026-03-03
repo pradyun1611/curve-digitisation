@@ -150,9 +150,9 @@ def preprocess_bw(
     image: Image.Image,
     plot_area: Tuple[int, int, int, int],
     *,
-    text_area_max_ratio: float = 0.005,
-    text_aspect_min: float = 0.3,
-    text_aspect_max: float = 3.5,
+    text_area_max_ratio: float = 0.008,
+    text_aspect_min: float = 0.2,
+    text_aspect_max: float = 5.0,
     close_kernel_size: Tuple[int, int] = (3, 7),
 ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int, int]]:
     """Preprocess a B/W image for skeleton extraction.
@@ -218,7 +218,8 @@ def preprocess_bw(
     binary = _remove_text_components(binary, rh, rw,
                                      area_max_ratio=text_area_max_ratio,
                                      aspect_min=text_aspect_min,
-                                     aspect_max=text_aspect_max)
+                                     aspect_max=text_aspect_max,
+                                     min_curve_span_ratio=0.15)
     _save_debug("preprocess_no_text", binary.astype(np.uint8) * 255)
 
     # Remove axis remnants at borders
@@ -236,18 +237,34 @@ def _remove_text_components(
     img_h: int,
     img_w: int,
     *,
-    area_max_ratio: float = 0.005,
-    aspect_min: float = 0.3,
-    aspect_max: float = 3.5,
-    min_skeleton_length: int = 30,
+    area_max_ratio: float = 0.008,
+    aspect_min: float = 0.2,
+    aspect_max: float = 5.0,
+    min_curve_span_ratio: float = 0.15,
+    euler_threshold: int = -1,
 ) -> np.ndarray:
-    """Remove connected components that are likely text labels.
+    """Remove connected components that are likely text / numeric labels.
 
-    Text heuristics:
-      - Small area relative to plot region
-      - Bounding-box aspect ratio typical of characters (0.3-3.5)
-      - Not part of a long continuous structure
-      - Located near margins
+    Robust text detection heuristics (catches labels like '110%', '80',
+    '%', 'SPEED' that appear inside the plot area):
+
+      1. **Size gate**: components smaller than ``area_max_ratio`` of the
+         plot area are candidates (curves are normally much larger).
+      2. **Aspect ratio**: character bounding boxes are roughly square or
+         slightly tall/wide (0.2–5.0).
+      3. **Euler number**: text characters and digit strings tend to have
+         holes (e.g., '0', '8', '%') giving Euler number ≤ 0.  Real
+         curves are simple arcs with Euler number = 1.
+      4. **Density / compactness**: text fills its bounding box densely
+         (> 15 %).  A thin curve crossing the same area would fill < 10 %.
+      5. **Horizontal span**: real curves span a large fraction of the
+         plot width; text spans < ``min_curve_span_ratio``.
+      6. **Branch density**: text has many branch-points per unit length
+         (junctions in letters like 'E', '%', 'S').
+
+    Components that fail ALL curve-like checks and pass text-like checks
+    are removed.  Large components and wide-spanning components are
+    always kept.
     """
     structure = np.ones((3, 3), dtype=int)
     labelled, n_comp = ndimage_label(binary, structure=structure)
@@ -257,19 +274,20 @@ def _remove_text_components(
 
     plot_area_px = img_h * img_w
     area_max = int(plot_area_px * area_max_ratio)
+    min_curve_span = int(img_w * min_curve_span_ratio)
 
     result = binary.copy()
     for comp_id in range(1, n_comp + 1):
         comp_mask = labelled == comp_id
         area = int(comp_mask.sum())
 
-        if area > area_max:
-            # Too large to be text — keep it
+        # Tiny speck — always remove
+        if area < 4:
+            result[comp_mask] = False
             continue
 
-        if area < 3:
-            # Tiny speck — remove
-            result[comp_mask] = False
+        # Large component — always keep (likely a curve)
+        if area > area_max:
             continue
 
         # Bounding box
@@ -277,30 +295,107 @@ def _remove_text_components(
         bbox_h = int(ys.max() - ys.min()) + 1
         bbox_w = int(xs.max() - xs.min()) + 1
         aspect = bbox_w / max(bbox_h, 1)
+        density = area / max(bbox_h * bbox_w, 1)
 
-        # Check if it's a character-like shape
-        if aspect_min <= aspect <= aspect_max and area < area_max:
-            # Check if near margins (outer 10% of plot area)
-            margin_x = img_w * 0.10
-            margin_y = img_h * 0.10
-            cx = float(np.mean(xs))
-            cy = float(np.mean(ys))
-            near_margin = (cx < margin_x or cx > img_w - margin_x or
-                          cy < margin_y or cy > img_h - margin_y)
+        # Wide-spanning component — likely a curve, keep it
+        if bbox_w >= min_curve_span:
+            continue
 
-            # Density: text chars are usually dense
-            density = area / (bbox_h * bbox_w)
+        # --- Text scoring (accumulate evidence) ---
+        text_evidence = 0.0
 
-            if near_margin or (density > 0.2 and bbox_w < img_w * 0.08):
-                result[comp_mask] = False
-                continue
+        # (a) Aspect ratio typical of characters / short labels
+        if aspect_min <= aspect <= aspect_max:
+            text_evidence += 0.15
 
-        # Small isolated component not spanning much width
-        x_span = bbox_w
-        if x_span < min_skeleton_length and area < area_max * 0.5:
+        # (b) Dense fill (text chars fill their bbox more than thin curves)
+        if density > 0.15:
+            text_evidence += 0.15
+        if density > 0.30:
+            text_evidence += 0.10
+
+        # (c) Euler number: count holes via flood-fill of bg inside bbox
+        euler = _euler_number_component(comp_mask, ys, xs)
+        if euler <= euler_threshold:
+            # Has holes (digits 0, 4, 6, 8, 9; '%' sign)
+            text_evidence += 0.25
+
+        # (d) Short horizontal span: curves are wide, text is narrow
+        span_ratio = bbox_w / max(img_w, 1)
+        if span_ratio < 0.08:
+            text_evidence += 0.20
+        elif span_ratio < min_curve_span_ratio:
+            text_evidence += 0.10
+
+        # (e) Branch density: text has many junctions per pixel
+        n_branches = _fast_branch_count(comp_mask, ys, xs)
+        branch_density = n_branches / max(area, 1)
+        if branch_density > 0.02:
+            text_evidence += 0.15
+        elif branch_density > 0.01:
+            text_evidence += 0.08
+
+        # (f) Near margins: labels often appear near axes or edges
+        cx = float(np.mean(xs))
+        cy = float(np.mean(ys))
+        margin_x = img_w * 0.12
+        margin_y = img_h * 0.12
+        near_margin = (cx < margin_x or cx > img_w - margin_x or
+                       cy < margin_y or cy > img_h - margin_y)
+        if near_margin:
+            text_evidence += 0.10
+
+        # --- Decision ---
+        if text_evidence >= 0.40:
             result[comp_mask] = False
 
     return result
+
+
+def _euler_number_component(
+    comp_mask: np.ndarray,
+    ys: np.ndarray,
+    xs: np.ndarray,
+) -> int:
+    """Estimate the Euler number (1 - #holes) of a binary component.
+
+    Uses the bounding-box sub-region to count internal background
+    connected components (holes).
+    """
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    sub = comp_mask[y0:y1, x0:x1]
+
+    # Pad with False so bg around the component is connected
+    padded = np.pad(sub, 1, mode='constant', constant_values=False)
+    bg = ~padded
+    bg_labelled, n_bg = ndimage_label(bg, structure=np.ones((3, 3), dtype=int))
+    # One bg region is the outer background; rest are holes
+    n_holes = max(n_bg - 1, 0)
+    return 1 - n_holes
+
+
+def _fast_branch_count(
+    comp_mask: np.ndarray,
+    ys: np.ndarray,
+    xs: np.ndarray,
+) -> int:
+    """Count branch-points (pixels with ≥ 3 neighbours) in a component.
+
+    Operates only on the bounding-box sub-region for speed.
+    """
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    sub = comp_mask[y0:y1, x0:x1].astype(np.uint8)
+    padded = np.pad(sub, 1, mode='constant')
+    nbr = np.zeros_like(sub, dtype=np.uint8)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            nbr += padded[1 + dy:padded.shape[0] - 1 + dy,
+                          1 + dx:padded.shape[1] - 1 + dx]
+    return int(np.sum((sub > 0) & (nbr >= 3)))
 
 
 def _remove_border_lines(binary: np.ndarray, border_px: int = 5) -> np.ndarray:
@@ -884,7 +979,7 @@ def trace_with_anchors(
         logger.warning("trace_with_anchors: no path found between anchors")
         return None
 
-    # Reconstruct path
+    # Reconstruct path from A* back-pointers
     path = []
     cur = (ex, ey)
     while cur != (-1, -1) and cur in came_from:
@@ -892,7 +987,26 @@ def trace_with_anchors(
         cur = came_from[cur]
     path.reverse()
 
-    logger.info("trace_with_anchors: found path with %d pixels", len(path))
+    # ------------------------------------------------------------------
+    # Anchor the polyline exactly at the user-selected start / end
+    # coordinates (the original, un-snapped positions).  This guarantees
+    # the returned polyline begins and ends EXACTLY where the user
+    # clicked, regardless of how far the snap moved the point.
+    # ------------------------------------------------------------------
+    orig_start = (start[0], start[1])
+    orig_end = (end[0], end[1])
+
+    # Prepend original start if different from first path point
+    if path and path[0] != orig_start:
+        path.insert(0, orig_start)
+    elif not path:
+        path = [orig_start]
+
+    # Append original end if different from last path point
+    if path[-1] != orig_end:
+        path.append(orig_end)
+
+    logger.info("trace_with_anchors: found path with %d pixels (anchored)", len(path))
     return path
 
 
@@ -1388,8 +1502,9 @@ def extract_bw_curves(
             _round, comp["area"], comp["x_span"],
         )
 
-    # Step 3: Extend curves toward boundaries
-    if extend_ends:
+    # Step 3: Extend curves toward boundaries (skip if anchors given —
+    #          the user's anchors define exact bounds)
+    if extend_ends and not anchors:
         for idx in list(result.keys()):
             pixels = result[idx]
             local_pixels = [(x - p_left, y - p_top) for x, y in pixels]
@@ -1402,11 +1517,103 @@ def extract_bw_curves(
             pixels = result[idx]
             if len(pixels) < 5:
                 continue
+            # Preserve first and last points (anchored endpoints)
+            first_pt = pixels[0]
+            last_pt = pixels[-1]
             smoothed = smooth_curve(
                 [(float(x), float(y)) for x, y in pixels],
                 window_length=smoothing_strength,
             )
-            result[idx] = [(int(round(x)), int(round(y))) for x, y in smoothed]
+            smoothed_int = [(int(round(x)), int(round(y))) for x, y in smoothed]
+            # Re-anchor first/last to exact positions
+            if smoothed_int:
+                smoothed_int[0] = first_pt
+                smoothed_int[-1] = last_pt
+            result[idx] = smoothed_int
+
+    # ── Debug visualisation ──
+    _save_bw_debug_overlay(
+        image, plot_area, skeleton, binary, result, anchors,
+    )
 
     logger.info("extract_bw_curves: extracted %d curves", len(result))
     return result
+
+
+def _save_bw_debug_overlay(
+    image: Image.Image,
+    plot_area: Tuple[int, int, int, int],
+    skeleton: np.ndarray,
+    binary: np.ndarray,
+    curves: Dict[int, List[Tuple[int, int]]],
+    anchors: Optional[List[Tuple[Tuple[int, int], Tuple[int, int]]]],
+) -> None:
+    """Save a composite debug image with overlays for diagnostics.
+
+    Saved artefacts (all under ``_DEBUG_DIR``):
+      - ``bw_debug_composite.png``  : plot-rect, skeleton, curves, anchors
+      - ``bw_debug_binary.png``     : cleaned binary mask
+      - ``bw_debug_skeleton.png``   : skeleton
+    """
+    if not _DEBUG_DIR:
+        return
+    try:
+        import copy
+        from PIL import ImageDraw
+
+        p_left, p_top, p_right, p_bottom = plot_area
+
+        # --- Composite overlay on original image ---
+        overlay = image.convert("RGBA").copy()
+        draw = ImageDraw.Draw(overlay)
+
+        # Plot rectangle (cyan)
+        draw.rectangle(
+            [p_left, p_top, p_right - 1, p_bottom - 1],
+            outline=(0, 255, 255, 200),
+            width=2,
+        )
+
+        # Curve polylines
+        curve_colors = [
+            (255, 0, 0, 230),    # red
+            (0, 200, 0, 230),    # green
+            (0, 80, 255, 230),   # blue
+            (255, 165, 0, 230),  # orange
+            (180, 0, 255, 230),  # purple
+        ]
+        for idx, pixels in curves.items():
+            c = curve_colors[idx % len(curve_colors)]
+            for i in range(len(pixels) - 1):
+                draw.line([pixels[i], pixels[i + 1]], fill=c, width=2)
+
+        # Anchor markers (start = green circle, end = red circle)
+        if anchors:
+            for start, end in anchors:
+                r = 6
+                draw.ellipse(
+                    [start[0] - r, start[1] - r, start[0] + r, start[1] + r],
+                    outline=(0, 255, 0, 255), width=2,
+                )
+                draw.ellipse(
+                    [end[0] - r, end[1] - r, end[0] + r, end[1] + r],
+                    outline=(255, 0, 0, 255), width=2,
+                )
+
+        out = Path(_DEBUG_DIR)
+        out.mkdir(parents=True, exist_ok=True)
+        overlay.save(str(out / "bw_debug_composite.png"))
+
+        # --- Skeleton overlay ---
+        skel_img = np.zeros((*skeleton.shape, 3), dtype=np.uint8)
+        skel_img[skeleton] = [0, 255, 0]
+        for idx, pixels in curves.items():
+            c_rgb = curve_colors[idx % len(curve_colors)][:3]
+            for px, py in pixels:
+                lx, ly = px - p_left, py - p_top
+                if 0 <= ly < skel_img.shape[0] and 0 <= lx < skel_img.shape[1]:
+                    skel_img[ly, lx] = c_rgb
+        Image.fromarray(skel_img).save(str(out / "bw_debug_skeleton_curves.png"))
+
+    except Exception as exc:
+        logger.debug("_save_bw_debug_overlay failed: %s", exc)

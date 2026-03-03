@@ -1036,6 +1036,14 @@ class CurveDigitizer:
         """
         Normalize pixel coordinates to axis coordinates.
         
+        Uses fence-post mapping: the first extractable pixel (p_left, p_top)
+        maps to (xMin, yMax) and the last extractable pixel
+        (p_right-1, p_bottom-1) maps to (xMax, yMin).
+        
+        This fixes the +1-unit Y-shift that occurred when using
+        p_right-p_left (N intervals) instead of p_right-p_left-1
+        (N-1 intervals between N pixel positions).
+        
         Args:
             pixel_coords: List of (pixel_x, pixel_y) tuples
             image_width: Image width in pixels
@@ -1051,17 +1059,20 @@ class CurveDigitizer:
         # Use plot area boundaries if available, else full image
         if plot_area:
             p_left, p_top, p_right, p_bottom = plot_area
-            p_width = p_right - p_left
-            p_height = p_bottom - p_top
         else:
             p_left, p_top = 0, 0
-            p_width = image_width
-            p_height = image_height
+            p_right, p_bottom = image_width, image_height
+        
+        # Fence-post: N pixels span N-1 intervals.
+        # p_left..p_right-1 are extractable pixel positions (p_right is exclusive).
+        # Number of intervals = (p_right - 1) - p_left = p_right - p_left - 1.
+        p_width  = max(p_right - p_left - 1, 1)
+        p_height = max(p_bottom - p_top - 1, 1)
         
         for px, py in pixel_coords:
             # Normalize pixel relative to plot area to 0-1 range
-            norm_x = (px - p_left) / p_width if p_width > 0 else 0
-            norm_y = 1 - ((py - p_top) / p_height) if p_height > 0 else 0  # Flip Y
+            norm_x = float(px - p_left) / p_width
+            norm_y = 1.0 - (float(py - p_top) / p_height)  # Flip Y
             
             # Clamp to [0, 1] — pixels outside plot area get clamped
             norm_x = max(0.0, min(1.0, norm_x))

@@ -84,8 +84,12 @@ def calibrate_simple(
     y_max = _get_axis_val(axis_info, 'yMax', 100)
 
     p_left, p_top, p_right, p_bottom = plot_area
-    plot_w = max(p_right - p_left, 1)
-    plot_h = max(p_bottom - p_top, 1)
+    # Fence-post: extractable pixel range is p_left..p_right-1
+    # (p_right is exclusive in Python slicing).  The number of
+    # intervals between the first and last extractable pixel is
+    # (p_right - 1) - p_left = p_right - p_left - 1.
+    plot_w = max(p_right - p_left - 1, 1)
+    plot_h = max(p_bottom - p_top - 1, 1)
 
     # Scale factors
     sx = (x_max - x_min) / plot_w
