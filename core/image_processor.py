@@ -439,6 +439,81 @@ class CurveDigitizer:
                     if labelled[y, x] in keep_labels]
         
         return filtered if len(filtered) >= 5 else pixels
+
+    def filter_spatially_near_anchor(
+        self,
+        pixels: List[Tuple[int, int]],
+        image_width: int,
+        image_height: int,
+        anchor_start: Tuple[int, int],
+        anchor_end: Tuple[int, int],
+    ) -> List[Tuple[int, int]]:
+        """Keep only the connected component(s) closest to an anchor pair.
+
+        Paints *pixels* onto a binary mask, runs 8-connectivity labelling,
+        then scores each component by the minimum Euclidean distance from
+        the anchor start **or** end point to any pixel in that component.
+        Only components that contain (or are closest to) at least one
+        anchor are kept.
+
+        This lets the user resolve ambiguity when multiple blobs of the
+        same colour exist — the anchor selects the correct blob.
+
+        Falls back to :meth:`filter_spatially_connected` when neither
+        anchor is near any component.
+        """
+        if len(pixels) < 10:
+            return pixels
+
+        from scipy.ndimage import label as ndimage_label
+
+        mask = np.zeros((image_height, image_width), dtype=np.uint8)
+        for x, y in pixels:
+            if 0 <= y < image_height and 0 <= x < image_width:
+                mask[y, x] = 1
+
+        structure = np.ones((3, 3), dtype=int)
+        labelled, n_components = ndimage_label(mask, structure=structure)
+
+        if n_components <= 1:
+            return pixels
+
+        # For each component, compute min distance to either anchor
+        sx, sy = anchor_start
+        ex, ey = anchor_end
+        keep_labels: set = set()
+        best_dist = float('inf')
+        best_label = -1
+
+        for comp_id in range(1, n_components + 1):
+            ys_c, xs_c = np.where(labelled == comp_id)
+            if len(ys_c) < 5:
+                continue
+            # Vectorized min distance to start anchor
+            d_start = float(np.min((xs_c - sx) ** 2 + (ys_c - sy) ** 2))
+            # Vectorized min distance to end anchor
+            d_end = float(np.min((xs_c - ex) ** 2 + (ys_c - ey) ** 2))
+            d_min = min(d_start, d_end)
+
+            # If anchor lands inside or very close (<15 px) to this component
+            if d_min < 15 ** 2:
+                keep_labels.add(comp_id)
+
+            if d_min < best_dist:
+                best_dist = d_min
+                best_label = comp_id
+
+        # Fallback: if no component is close enough, keep the nearest one
+        if not keep_labels and best_label > 0:
+            keep_labels = {best_label}
+
+        if not keep_labels:
+            return self.filter_spatially_connected(pixels, image_width, image_height)
+
+        filtered = [(x, y) for x, y in pixels
+                    if labelled[y, x] in keep_labels]
+
+        return filtered if len(filtered) >= 5 else pixels
     
     # ─────────────────────────────────────────────────────────────
     #  Grayscale / B&W image support
@@ -1851,6 +1926,10 @@ class CurveDigitizer:
                           for cf in features['curves']]
             has_colored_series = any(c not in _DARK_NAMES for c in all_colors)
 
+            # Build anchor lookup: anchor_pairs[i] → curve index i
+            _anchor_list = anchors or []
+            _color_curve_idx = -1   # running index of non-skipped curves
+
             for idx, curve_feature in enumerate(features['curves']):
                 color = curve_feature.get('color', 'unknown')
                 label = curve_feature.get('label', f'Curve {idx+1}')
@@ -1862,6 +1941,8 @@ class CurveDigitizer:
                 # Skip surge line — it's a reference boundary, not a performance curve
                 if 'surge' in label.lower():
                     continue
+
+                _color_curve_idx += 1
                 
                 # Extract pixels using dynamic RGB range adaptation
                 pixels = self.extract_color_pixels_dynamic(image, color)
@@ -1871,9 +1952,15 @@ class CurveDigitizer:
                 pixels = [(x, y) for x, y in pixels
                           if p_left <= x <= p_right and p_top <= y <= p_bottom]
                 
-                # Spatial continuity filter: keep only the largest connected
-                # blob to remove stray pixels from adjacent-colour curves
-                pixels = self.filter_spatially_connected(pixels, width, height)
+                # Spatial continuity filter: if an anchor pair exists for
+                # this curve, prefer the blob nearest to the anchors;
+                # otherwise keep the largest connected blob.
+                if _color_curve_idx < len(_anchor_list) and _anchor_list[_color_curve_idx]:
+                    a_start, a_end = _anchor_list[_color_curve_idx]
+                    pixels = self.filter_spatially_near_anchor(
+                        pixels, width, height, a_start, a_end)
+                else:
+                    pixels = self.filter_spatially_connected(pixels, width, height)
                 
                 if len(pixels) < 2:
                     results['curves'][color] = {

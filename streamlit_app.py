@@ -247,9 +247,18 @@ def main():
         key="image_uploader"
     )
 
+    # ── Reset anchors when a different image is uploaded ──
+    if uploaded_file is not None:
+        _current_name = uploaded_file.name
+        if st.session_state.get("_last_uploaded_file") != _current_name:
+            st.session_state["_last_uploaded_file"] = _current_name
+            st.session_state.pop("click_curves", None)
+            st.session_state.pop("picking", None)
+            st.session_state.pop("last_click_xy", None)
+
     # ── Click-to-place anchor canvas ──
     if uploaded_file is not None:
-        with st.expander("📍 Click-to-Place Anchors (B/W)", expanded=False):
+        with st.expander("📍 Click-to-Place Anchors", expanded=False):
             st.caption(
                 "Add curves below, then click 📌 Start / 📌 End and click "
                 "on the image to place anchor points.  Anchors are sent to "
