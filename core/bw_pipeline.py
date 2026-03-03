@@ -1309,68 +1309,84 @@ def extract_bw_curves(
     # Pre-compute distance transform on binary for anchor tracing
     dt = distance_transform_edt(binary)
 
-    # Step 2: Extract or trace curves
+    # Step 2: Extract curves (hybrid)
+    # - If anchors are provided, trace those first.
+    # - Then auto-extract remaining curves so partial anchors still
+    #   produce the full curve set.
     result: Dict[int, List[Tuple[int, int]]] = {}
+    target = max(num_curves, 1)
+    working_skeleton = skeleton.copy()
 
+    def _mask_pixels(mask_img: np.ndarray, pixels_local: List[Tuple[int, int]], radius: int = 2) -> None:
+        for px, py in pixels_local:
+            for dy in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    ny, nx = py + dy, px + dx
+                    if 0 <= ny < rh and 0 <= nx < rw:
+                        mask_img[ny, nx] = False
+
+    # 2a) Anchor-guided tracing (if provided)
     if anchors:
-        # Anchor-guided tracing (primary for B/W)
-        for idx, (start, end) in enumerate(anchors):
+        for start, end in anchors:
+            if len(result) >= target:
+                break
+
             local_start = (start[0] - p_left, start[1] - p_top)
             local_end = (end[0] - p_left, end[1] - p_top)
 
             path = trace_with_anchors(
-                skeleton, local_start, local_end,
+                working_skeleton, local_start, local_end,
                 distance_transform=dt,
             )
-            if path:
-                full_path = [(x + p_left, y + p_top) for x, y in path]
-                result[idx] = full_path
-    else:
-        # Iterative multi-curve extraction:
-        # 1. Extract components, pick the best one
-        # 2. Mask its pixels from skeleton
-        # 3. Repeat until we have enough curves or no good candidates remain
-        working_skeleton = skeleton.copy()
-        target = max(num_curves, 1)
-        max_rounds = target + 3  # allow a few extra rounds for safety
+            if not path:
+                continue
 
-        for _round in range(max_rounds):
-            if len(result) >= target:
-                break
-
-            components = extract_skeleton_components(working_skeleton)
-            if not components:
-                break
-
-            selected = select_best_curves(
-                components, 1,
-                dashed_threshold=dashed_threshold,
-                text_threshold=text_threshold,
-                ignore_dashed=ignore_dashed,
-                auto_detect=False,
-            )
-            if not selected:
-                break
-
-            comp = selected[0]
             idx = len(result)
-            raw_pixels = comp["pixels"]
-            ordered = order_pixels_to_polyline(raw_pixels)
-            full_pixels = [(x + p_left, y + p_top) for x, y in ordered]
-            result[idx] = full_pixels
+            full_path = [(x + p_left, y + p_top) for x, y in path]
+            result[idx] = full_path
 
-            # Mask this curve's pixels (+ small dilation) from working skeleton
-            for px, py in raw_pixels:
-                for dy in range(-2, 3):
-                    for dx in range(-2, 3):
-                        ny, nx = py + dy, px + dx
-                        if 0 <= ny < rh and 0 <= nx < rw:
-                            working_skeleton[ny, nx] = False
+            # Remove traced path from working skeleton so auto-pass finds
+            # other curves instead of duplicating this one.
+            _mask_pixels(working_skeleton, path, radius=2)
 
-            logger.debug(
-                "Iterative extraction round %d: picked component with %d px, x_span=%d",
-                _round, comp["area"], comp["x_span"],
-            )
+    # 2b) Iterative multi-curve extraction for any remaining curves
+    # 1. Extract components, pick the best one
+    # 2. Mask its pixels from skeleton
+    # 3. Repeat until we have enough curves or no good candidates remain
+    max_rounds = target + 3  # allow a few extra rounds for safety
+
+    for _round in range(max_rounds):
+        if len(result) >= target:
+            break
+
+        components = extract_skeleton_components(working_skeleton)
+        if not components:
+            break
+
+        selected = select_best_curves(
+            components, 1,
+            dashed_threshold=dashed_threshold,
+            text_threshold=text_threshold,
+            ignore_dashed=ignore_dashed,
+            auto_detect=False,
+        )
+        if not selected:
+            break
+
+        comp = selected[0]
+        idx = len(result)
+        raw_pixels = comp["pixels"]
+        ordered = order_pixels_to_polyline(raw_pixels)
+        full_pixels = [(x + p_left, y + p_top) for x, y in ordered]
+        result[idx] = full_pixels
+
+        # Mask this curve's pixels (+ small dilation) from working skeleton
+        _mask_pixels(working_skeleton, raw_pixels, radius=2)
+
+        logger.debug(
+            "Iterative extraction round %d: picked component with %d px, x_span=%d",
+            _round, comp["area"], comp["x_span"],
+        )
 
     # Step 3: Extend curves toward boundaries
     if extend_ends:
