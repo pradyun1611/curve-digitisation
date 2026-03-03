@@ -1687,14 +1687,23 @@ class CurveDigitizer:
         image = self.crop_image(image, crop_box)
         
         width, height = image.size
-        
+
+        # --- Mode Router: HSV-based auto-detection ---
+        # Map legacy mode names for backward compatibility
+        mode_map = {'grayscale': 'bw', 'color': 'color', 'auto': 'auto'}
+        router_mode = mode_map.get(mode, mode)
+        detected_mode = classify_image_mode(image, mode_override=router_mode)
+        grayscale_mode = (detected_mode == 'bw')
+
         # Detect actual plot area boundaries for accurate coordinate mapping
         if plot_area_override:
             plot_area = plot_area_override
         else:
             plot_area = self.detect_plot_area(image)
-            # Refine with tick-mark detection for more accurate y-mapping
-            plot_area = self._refine_plot_area_with_ticks(image, plot_area)
+            # Tick-based refinement is useful for B/W charts but can bias
+            # coloured charts upward (ticks are not always at true bounds).
+            if grayscale_mode:
+                plot_area = self._refine_plot_area_with_ticks(image, plot_area)
         
         results = {
             'image_path': image_path,
@@ -1705,12 +1714,6 @@ class CurveDigitizer:
             'curves': {}
         }
         
-        # --- Mode Router: HSV-based auto-detection ---
-        # Map legacy mode names for backward compatibility
-        mode_map = {'grayscale': 'bw', 'color': 'color', 'auto': 'auto'}
-        router_mode = mode_map.get(mode, mode)
-        detected_mode = classify_image_mode(image, mode_override=router_mode)
-        grayscale_mode = (detected_mode == 'bw')
         results['grayscale_mode'] = bool(grayscale_mode)
         results['detected_mode'] = detected_mode
         
