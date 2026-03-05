@@ -149,6 +149,7 @@ def process_image(client: OpenAIClient, image_file, user_query: str, output_dir:
             dashed_threshold = settings.get("dashed_threshold", 0.45)
             text_threshold = settings.get("text_threshold", 0.50)
             plot_area_override = settings.get("plot_area_override", None)
+            exclude_curve_mode = settings.get("exclude_curve_mode", "")
             
             results = digitizer.process_curve_image(
                 temp_path, features, output_dir,
@@ -161,6 +162,7 @@ def process_image(client: OpenAIClient, image_file, user_query: str, output_dir:
                 dashed_threshold=dashed_threshold,
                 text_threshold=text_threshold,
                 plot_area_override=plot_area_override,
+                exclude_curve_mode=exclude_curve_mode,
             )
         
         # Attach pipeline settings metadata for export provenance

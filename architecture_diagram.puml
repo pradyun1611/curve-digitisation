@@ -1,0 +1,552 @@
+@startuml "Curve Digitization Architecture"
+
+!theme plain
+skinparam backgroundColor #FEFEFE
+skinparam componentStyle rectangle
+skinparam packageStyle frame
+skinparam shadowing false
+skinparam defaultFontSize 11
+skinparam ArrowThickness 1.5
+skinparam RoundCorner 10
+
+title **Performance Curve Digitization — Full Architecture**\n
+
+' ========================================================================
+' ACTORS / EXTERNAL SYSTEMS
+' ========================================================================
+actor "User" as user
+cloud "Azure OpenAI\n(GPT)" as azure <<External>>
+database "File System\n(output/)" as fs
+
+' ========================================================================
+' ENTRY POINTS (top layer)
+' ========================================================================
+package "Entry Points" #E3F2FD {
+    [main.py\n(CLI Chatbot)] as main
+    [streamlit_app.py\n(Web UI)] as stapp
+    [api.py\n(FastAPI REST)] as api
+}
+
+' ========================================================================
+' UI LAYER (Streamlit components)
+' ========================================================================
+package "ui/" #FFF3E0 {
+    [sidebar.py\nPipeline Settings\n& API Config] as sidebar
+    [chat_interface.py\nChat History &\nMessage Display] as chat_ui
+    [result_display.py\nMetrics, Curves,\nExport (CSV/JSON)] as result_disp
+    [click_canvas.py\nInteractive Anchor\nPlacement] as click_canvas
+}
+
+' ========================================================================
+' CORE LAYER
+' ========================================================================
+package "core/" #E8F5E9 {
+
+    ' ── Orchestration ──
+    package "Orchestration" #C8E6C9 {
+        [pipeline.py\nrun_pipeline()\nUnified Flow] as pipeline
+        [router.py\nclassify_image_mode()\n(color / bw)] as router
+    }
+
+    ' ── AI / LLM ──
+    package "AI Integration" #BBDEFB {
+        [openai_client.py\nOpenAIClient\n• classify_intent()\n• extract_axis_info()\n• extract_curve_features()\n• get_general_response()] as openai_client
+    }
+
+    ' ── Image Processing ──
+    package "Image Processing" #FFF9C4 {
+        [image_processor.py\nCurveDigitizer\n• detect_plot_area()\n• extract_curves_grayscale()\n• extract_color_pixels()\n• normalize_to_axis()\n• fit_polynomial_curve()\n• fit_spline_curve()\n• clean_coordinates_local()\n• process_curve_image()\n• generate_digitized_graphs()] as img_proc
+    }
+
+    ' ── B/W Pipeline ──
+    package "B/W Pipeline" #F3E5F5 {
+        [bw_pipeline.py\n• detect_plot_area_robust()\n• remove_gridlines()\n• remove_text_labels()\n• remove_tick_marks()\n• skeletonize + trace\n• A* curve tracing\n• extend_curve_ends()\n• smooth_curve()\n• extract_bw_curves()] as bw_pipeline
+        [bw_reconstruction.py\n• merge_fragments()\n• fit_auto_degree()\n• fit_piecewise()\n• reconstruct_bw_curves()] as bw_recon
+    }
+
+    ' ── Calibration & Mapping ──
+    package "Calibration & Mapping" #FFECB3 {
+        [calibration.py\nCalibrationResult\n• calibrate_simple()\n• calibrate_manual()\n• pixel_to_data()\n• data_to_pixel()\n• validate_calibration()\n• build_mapping_from_calibration()] as calibration
+        [scale.py\n• compute_affine_mapping()\n• roundtrip_error()\nMappingResult (2×3 affine)] as scale
+    }
+
+    ' ── Evaluation ──
+    package "Evaluation" #FFCDD2 {
+        [metrics.py\n• compute_self_consistency_metrics()\n• compute_ground_truth_metrics()\n• compute_series_regression()\n• parse_ground_truth_csv()\n• parse_ground_truth_json()] as metrics
+        [reconstruction.py\n• build_masks()\n• render_reconstructed_plot()\n• render_overlay_comparison()] as reconstruction
+    }
+
+    ' ── Data Types ──
+    package "Data Types & Config" #E0E0E0 {
+        [types.py\n• AxisInfo\n• CurveFeature\n• FitResult\n• CurveResult\n• MappingResult\n• MetricsResult\n• ExtractionResult] as types
+        [config.py\nBWPipelineConfig\n(all tunable defaults)] as config
+    }
+
+    ' ── I/O ──
+    package "I/O Utilities" #D7CCC8 {
+        [io_utils.py\n• write_metrics_json()\n• write_report_json()\n• build_download_zip()\n• load_report_json()\n• list_job_artifacts()] as io_utils
+    }
+
+    ' ── SSL Bootstrap ──
+    [__init__.py\nSSL Fix &\nPublic API Exports] as core_init
+}
+
+' ── Config ──
+package "Config" #EFEBE9 {
+    [local_config.py\nSSL Certificate Fix\n& Truststore Injection] as local_config
+}
+
+' ========================================================================
+' RELATIONSHIPS
+' ========================================================================
+
+' -- User to entry points --
+user --> stapp : "Browser"
+user --> main : "Terminal"
+user --> api : "HTTP"
+
+' -- Entry points to UI --
+stapp --> sidebar : configures
+stapp --> chat_ui : displays
+stapp --> result_disp : shows results
+stapp --> click_canvas : anchor input
+
+' -- Entry points to core --
+main --> openai_client : classify, extract
+main --> img_proc : process_curve_image()
+stapp --> openai_client : classify, extract
+stapp --> img_proc : process_curve_image()
+api --> openai_client : classify, extract
+api --> pipeline : run_pipeline()
+api --> io_utils : load/zip artifacts
+api --> metrics : evaluate with GT
+
+' -- AI to external --
+openai_client --> azure : "API calls\n(intent, axis, features)"
+
+' -- Pipeline orchestration --
+pipeline --> img_proc : digitize curves
+pipeline --> router : classify color/bw
+pipeline --> calibration : calibrate_from_axis_info()
+pipeline --> scale : compute_affine_mapping()
+pipeline --> reconstruction : render artifacts
+pipeline --> metrics : compute metrics
+pipeline --> io_utils : persist JSON
+
+' -- Image processor internals --
+img_proc --> router : classify_image_mode()
+img_proc --> bw_pipeline : "B/W path"
+img_proc --> bw_recon : reconstruct B/W curves
+img_proc --> calibration : pixel↔data
+
+' -- B/W pipeline --
+bw_pipeline --> config : BWPipelineConfig
+bw_recon ..> types : FitResult
+
+' -- Calibration & Scale --
+calibration --> scale
+calibration --> types : MappingResult, AxisInfo
+scale --> types
+
+' -- Evaluation --
+metrics --> types : MetricsResult
+reconstruction --> calibration : data→pixel
+reconstruction ..> types
+
+' -- Data persistence --
+pipeline --> fs : "report.json, metrics.json,\nimages, debug.json"
+img_proc --> fs : "curve_digitization.json,\noverlay, graphs"
+io_utils --> fs
+
+' -- Config / SSL --
+core_init --> openai_client : exports
+core_init --> img_proc : exports
+api ..> local_config : SSL fix
+
+' ========================================================================
+' LEGEND
+' ========================================================================
+legend right
+  |= Color |= Layer |
+  | <#E3F2FD> | Entry Points (CLI / Web / API) |
+  | <#FFF3E0> | UI Components (Streamlit) |
+  | <#C8E6C9> | Orchestration (Pipeline, Router) |
+  | <#BBDEFB> | AI / LLM Integration |
+  | <#FFF9C4> | Image Processing (Color + Legacy GS) |
+  | <#F3E5F5> | B/W Pipeline (Skeleton-based) |
+  | <#FFECB3> | Calibration & Coordinate Mapping |
+  | <#FFCDD2> | Evaluation & Reconstruction |
+  | <#E0E0E0> | Data Types & Config |
+  | <#D7CCC8> | I/O Utilities |
+endlegend
+
+@enduml
+
+
+' ========================================================================
+' SEPARATE DIAGRAM: DATA FLOW (Sequence)
+' ========================================================================
+
+@startuml "Curve Digitization — Data Flow"
+
+!theme plain
+skinparam backgroundColor #FEFEFE
+skinparam participantPadding 10
+skinparam sequenceArrowThickness 1.5
+
+title **Curve Digitization — End-to-End Data Flow**\n
+
+actor User as U
+participant "Streamlit UI\n/ CLI / API" as EP
+participant "OpenAIClient" as OAI
+participant "Router" as RTR
+participant "CurveDigitizer\n(image_processor)" as DIG
+participant "B/W Pipeline\n(bw_pipeline)" as BW
+participant "B/W Reconstruction\n(bw_reconstruction)" as BWR
+participant "Calibration\n& Scale" as CAL
+participant "Reconstruction\n(overlay/plot)" as REC
+participant "Metrics" as MET
+participant "I/O Utils" as IO
+database "File System" as FS
+cloud "Azure OpenAI" as AZ
+
+== 1. User Input ==
+U -> EP : Upload image + query
+EP -> OAI : classify_intent(query)
+OAI -> AZ : GPT call
+AZ --> OAI : "imageprocessing"
+OAI --> EP : intent
+
+== 2. AI-based Extraction ==
+EP -> OAI : extract_axis_info(image_b64)
+OAI -> AZ : GPT vision call
+AZ --> OAI : {xMin, xMax, yMin, yMax, units}
+OAI --> EP : axis_info
+
+EP -> OAI : extract_curve_features(image_b64)
+OAI -> AZ : GPT vision call
+AZ --> OAI : {curves: [{color, shape, label, trend}]}
+OAI --> EP : features
+
+== 3. Image Processing ==
+EP -> DIG : process_curve_image(image, features)
+DIG -> RTR : classify_image_mode(image)
+RTR --> DIG : "color" | "bw"
+
+alt Color Path
+    DIG -> DIG : extract_color_pixels()
+    DIG -> DIG : detect_plot_area()
+    DIG -> DIG : normalize_to_axis()
+    DIG -> DIG : clean_coordinates_local()
+    DIG -> DIG : fit_polynomial_curve()
+else B/W Path
+    DIG -> BW : extract_bw_curves(image, anchors)
+    BW -> BW : detect_plot_area_robust()
+    BW -> BW : remove_gridlines()
+    BW -> BW : remove_text_labels()
+    BW -> BW : remove_tick_marks()
+    BW -> BW : skeletonize + A* trace
+    BW -> BW : extend_curve_ends()
+    BW -> BW : smooth_curve()
+    BW --> DIG : raw pixel curves
+    DIG -> BWR : reconstruct_bw_curves()
+    BWR -> BWR : merge_fragments()
+    BWR -> BWR : fit_auto_degree()
+    BWR --> DIG : fitted curves
+end
+
+DIG -> DIG : generate_digitized_graphs()
+DIG --> EP : raw_results dict
+
+== 4. Calibration & Mapping ==
+EP -> CAL : calibrate_from_axis_info(axis_info, plot_area)
+CAL --> EP : CalibrationResult + MappingResult
+note right: Affine 2×3 matrix\npixel ↔ data space
+
+== 5. Reconstruction & Artifacts ==
+EP -> REC : render_reconstructed_plot(curves, axis_info)
+REC --> FS : reconstructed_plot.png
+EP -> REC : render_overlay_comparison(image, curves)
+REC --> FS : overlay_comparison.png
+
+== 6. Metrics Computation ==
+EP -> REC : build_masks(curves, image)
+REC --> EP : original_mask, recon_mask
+EP -> MET : compute_self_consistency_metrics(masks)
+MET --> EP : MetricsResult {delta, IoU, SSIM, precision, recall}
+
+opt Ground Truth Provided
+    EP -> MET : compute_ground_truth_metrics(extracted, gt)
+    MET --> EP : MetricsResult {rmse_y, mae_y, delta_data}
+end
+
+== 7. Persist Results ==
+EP -> IO : write report.json, metrics.json
+IO -> FS : Save all artifacts
+EP --> U : Display results + metrics
+
+@enduml
+
+
+' ========================================================================
+' SEPARATE DIAGRAM: CLASS DIAGRAM
+' ========================================================================
+
+@startuml "Curve Digitization — Class Diagram"
+
+!theme plain
+skinparam backgroundColor #FEFEFE
+skinparam classAttributeIconSize 0
+skinparam RoundCorner 10
+
+title **Curve Digitization — Key Classes & Data Types**\n
+
+package "core.openai_client" #BBDEFB {
+    class OpenAIClient {
+        - api_key: str
+        - endpoint: str
+        - deployment_name: str
+        - client: AzureOpenAI
+        + classify_intent(query): str
+        + extract_axis_info(image_b64, query): dict
+        + extract_curve_features(image_b64): dict
+        + get_general_response(query): str
+        + classify_data_field(name, value): dict
+    }
+}
+
+package "core.image_processor" #FFF9C4 {
+    class CurveDigitizer {
+        - axis_info: dict
+        - xMin, xMax, yMin, yMax: float
+        - xUnit, yUnit: str
+        + load_image(path): Image
+        + detect_plot_area(image): tuple
+        + extract_curves_grayscale(image, num, area): dict
+        + extract_color_pixels(image, color): list
+        + normalize_to_axis(pixels, w, h, area): list
+        + clean_coordinates_local(coords): list
+        + fit_polynomial_curve(coords, degree): dict
+        + fit_spline_curve(coords): dict
+        + calculate_curve_metrics(coords, fit): dict
+        + generate_digitized_graphs(results, dir, ts): dict
+        + process_curve_image(path, features, dir): dict
+    }
+}
+
+package "core.types" #E0E0E0 {
+    class AxisInfo {
+        + xMin: float
+        + xMax: float
+        + yMin: float
+        + yMax: float
+        + xUnit: str
+        + yUnit: str
+        + imageDescription: str
+        + has_mapping: bool
+        + from_dict(d): AxisInfo
+        + to_dict(): dict
+    }
+
+    class CurveFeature {
+        + color: str
+        + shape: str
+        + label: str
+        + trend: str
+        + approximate_values: str
+    }
+
+    class FitResult {
+        + degree: int
+        + coefficients: list
+        + r_squared: float
+        + fitted_points: list
+        + equation: str
+    }
+
+    class CurveResult {
+        + label: str
+        + color: str
+        + original_point_count: int
+        + normalized_point_count: int
+        + cleaned_point_count: int
+        + fit_result: FitResult
+        + pixel_coords: list
+        + axis_coords: list
+    }
+
+    class MappingResult {
+        + pixel_to_data_matrix: list
+        + data_to_pixel_matrix: list
+        + frame: str
+        + x_direction: int
+        + y_direction: int
+        + plot_area_width: int
+        + plot_area_height: int
+        + mapping_roundtrip_error_mean_px: float
+    }
+
+    class MetricsResult {
+        + mode: str
+        + delta_value: float
+        + delta_norm: float
+        + iou: float
+        + precision: float
+        + recall: float
+        + ssim: float
+        + rmse_y: float
+        + mapping_status: str
+    }
+
+    class ExtractionResult {
+        + job_id: str
+        + image_path: str
+        + axis_info: AxisInfo
+        + curves: dict<str, CurveResult>
+        + metrics: MetricsResult
+        + mapping: MappingResult
+        + artifacts: list
+        + to_dict(): dict
+    }
+}
+
+package "core.calibration" #FFECB3 {
+    class CalibrationResult {
+        + method: str
+        + x_min, x_max: float
+        + y_min, y_max: float
+        + plot_area: tuple
+        + pixel_to_data: list
+        + data_to_pixel: list
+        + validation_error_mean_px: float
+    }
+}
+
+package "core.config" #E0E0E0 {
+    class BWPipelineConfig {
+        + roi_dark_threshold: int
+        + grid_h_kernel_ratio: float
+        + text_area_max_ratio: float
+        + dashed_threshold: float
+        + smoothing_polyorder: int
+        + snap_radius: int
+        + curvature_penalty: float
+        + gap_bridge_max: int
+        + extend_search_radius: int
+        + tracker_max_y_jump_ratio: float
+        + close_kernel_size: tuple
+    }
+}
+
+' Relationships
+ExtractionResult *-- AxisInfo
+ExtractionResult *-- "0..*" CurveResult
+ExtractionResult *-- MetricsResult
+ExtractionResult *-- MappingResult
+CurveResult *-- FitResult
+
+CurveDigitizer ..> AxisInfo : uses
+CurveDigitizer ..> CurveFeature : uses
+CurveDigitizer ..> FitResult : produces
+
+OpenAIClient ..> AxisInfo : produces (dict)
+OpenAIClient ..> CurveFeature : produces (dict)
+
+@enduml
+
+
+' ========================================================================
+' SEPARATE DIAGRAM: DEPLOYMENT / COMPONENT VIEW
+' ========================================================================
+
+@startuml "Curve Digitization — Deployment View"
+
+!theme plain
+skinparam backgroundColor #FEFEFE
+skinparam nodeStyle rectangle
+
+title **Deployment & Component View**\n
+
+node "User Machine" {
+
+    package "Python 3.x + .venv" {
+
+        component "CLI Chatbot\n(main.py)" as cli
+        component "Streamlit Web UI\n(streamlit_app.py)" as web
+        component "FastAPI Server\n(api.py)" as rest
+
+        package "core/" {
+            component "OpenAIClient" as oai_comp
+            component "CurveDigitizer" as dig_comp
+            component "Pipeline" as pipe_comp
+            component "Router" as rtr_comp
+            component "B/W Pipeline" as bw_comp
+            component "B/W Reconstruction" as bwr_comp
+            component "Calibration" as cal_comp
+            component "Scale" as scl_comp
+            component "Metrics" as met_comp
+            component "Reconstruction" as rec_comp
+            component "I/O Utils" as io_comp
+            component "Types" as typ_comp
+            component "Config" as cfg_comp
+        }
+
+        package "ui/" {
+            component "Sidebar" as ui_side
+            component "Chat Interface" as ui_chat
+            component "Result Display" as ui_result
+            component "Click Canvas" as ui_click
+        }
+
+        folder "output/{job_id}/" as outdir {
+            file "report.json" as rpt
+            file "metrics.json" as met_f
+            file "debug.json" as dbg
+            file "reconstructed_plot.png" as rplot
+            file "overlay_comparison.png" as olay
+            file "original_series_mask.png" as omask
+            file "reconstructed_mask.png" as rmask
+            file "mask_diff.png" as mdiff
+            file "input_<name>.png" as inp
+        }
+    }
+}
+
+cloud "Azure OpenAI Service" as azure_svc {
+    component "GPT Vision Model" as gpt
+}
+
+' Connections
+cli --> oai_comp
+cli --> dig_comp
+web --> ui_side
+web --> ui_chat
+web --> ui_result
+web --> ui_click
+web --> oai_comp
+web --> dig_comp
+rest --> pipe_comp
+rest --> oai_comp
+rest --> io_comp
+
+pipe_comp --> dig_comp
+pipe_comp --> rtr_comp
+pipe_comp --> cal_comp
+pipe_comp --> met_comp
+pipe_comp --> rec_comp
+pipe_comp --> io_comp
+
+dig_comp --> rtr_comp
+dig_comp --> bw_comp
+dig_comp --> bwr_comp
+dig_comp --> cal_comp
+
+cal_comp --> scl_comp
+bw_comp --> cfg_comp
+
+oai_comp --> azure_svc : HTTPS
+
+pipe_comp --> outdir
+dig_comp --> outdir
+
+@enduml

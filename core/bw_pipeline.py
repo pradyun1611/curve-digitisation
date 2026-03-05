@@ -26,10 +26,15 @@ import numpy as np
 from PIL import Image, ImageFilter
 from scipy.ndimage import (
     binary_closing,
+    binary_dilation,
     binary_opening,
     distance_transform_edt,
+    grey_closing,
     label as ndimage_label,
+    uniform_filter,
 )
+
+from core.config import BWPipelineConfig, DEFAULT_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +159,7 @@ def preprocess_bw(
     text_aspect_min: float = 0.2,
     text_aspect_max: float = 5.0,
     close_kernel_size: Tuple[int, int] = (3, 7),
+    config: Optional[BWPipelineConfig] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int, int]]:
     """Preprocess a B/W image for skeleton extraction.
 
@@ -170,6 +176,8 @@ def preprocess_bw(
          binary_cleaned: bool array before skeletonize
          adjusted_plot_area: the actual (left, top, right, bottom) used
     """
+    cfg = config or DEFAULT_CONFIG
+
     img_array = np.array(image.convert("RGB"))
     p_left, p_top, p_right, p_bottom = plot_area
 
@@ -181,40 +189,51 @@ def preprocess_bw(
         gray = region.astype(np.uint8)
     rh, rw = gray.shape
 
-    # Denoise
+    # ── Enhanced preprocessing: CLAHE contrast normalization ──
+    if cfg.clahe_clip_limit > 0:
+        gray = _apply_clahe(gray, cfg.clahe_clip_limit, cfg.clahe_tile_grid_size)
+        _save_debug("preprocess_clahe", gray)
+
+    # Denoise (median filter for general use)
     gray = np.array(Image.fromarray(gray).filter(ImageFilter.MedianFilter(size=3)))
+
+    # ── Enhanced preprocessing: Black-hat stroke enhancement ──
+    if cfg.use_blackhat:
+        gray = _apply_blackhat(gray, cfg.blackhat_kernel)
+        _save_debug("preprocess_blackhat", gray)
 
     # Adaptive Otsu threshold
     threshold = _otsu_threshold(gray)
     binary = gray <= min(threshold + 10, 200)
+
+    # ── Enhanced preprocessing: density check + adaptive fallback ──
+    if cfg.adaptive_thresh:
+        fg_ratio = float(binary.sum()) / max(binary.size, 1)
+        if fg_ratio > 0.50 or fg_ratio < 0.01:
+            logger.info("preprocess_bw: Otsu fg_ratio=%.3f out of range, "
+                        "falling back to adaptive threshold", fg_ratio)
+            binary = _adaptive_threshold(gray, cfg.adaptive_block_size,
+                                         cfg.adaptive_C)
+
     _save_debug("preprocess_binary", binary.astype(np.uint8) * 255)
 
-    # Morphological close to bridge small gaps
-    ck = np.ones(close_kernel_size, dtype=bool)
-    binary = binary_closing(binary, structure=ck, iterations=1)
+    # ── Enhanced preprocessing: Hough-based axis/gridline removal ──
+    if cfg.hough_remove_axes:
+        binary = _remove_lines_hough(binary, rh, rw, cfg)
+        _save_debug("preprocess_hough_cleaned", binary.astype(np.uint8) * 255)
 
-    # Remove grid lines (rows/cols with >75% fill)
-    row_fill = binary.sum(axis=1) / rw
-    binary[row_fill > 0.75, :] = False
-    col_fill = binary.sum(axis=0) / rh
-    binary[:, col_fill > 0.75] = False
+    # ── Correct operation order: grid → text → tick → close → noise → border → skel ──
+    # This order ensures:
+    #   - Gridlines removed before they can be merged with curves by closing
+    #   - Text removed before closing can merge chars with adjacent curves
+    #   - Closing bridges gaps in CLEAN curve-only pixels
+    #   - Text removal is deterministic in ONE pass (no need to run twice)
 
-    # Remove isolated single-pixel noise (but preserve thin curves)
-    # Instead of morphological opening, remove pixels with 0 or 1 neighbors
-    ys, xs = np.where(binary)
-    if len(ys) > 0:
-        padded = np.pad(binary.astype(np.uint8), 1, mode='constant')
-        neighbor_count = np.zeros_like(binary, dtype=np.uint8)
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dy == 0 and dx == 0:
-                    continue
-                neighbor_count += padded[1 + dy:padded.shape[0] - 1 + dy,
-                                         1 + dx:padded.shape[1] - 1 + dx]
-        # Remove truly isolated pixels (0 neighbors)
-        binary[neighbor_count == 0] = False
+    # 1. Remove gridlines (morphological line kernels)
+    binary = _remove_gridlines_morph(binary, rh, rw)
+    _save_debug("preprocess_no_grid", binary.astype(np.uint8) * 255)
 
-    # Remove text via connected-component analysis
+    # 2. Remove text BEFORE closing (prevents text merging with curves)
     binary = _remove_text_components(binary, rh, rw,
                                      area_max_ratio=text_area_max_ratio,
                                      aspect_min=text_aspect_min,
@@ -222,10 +241,29 @@ def preprocess_bw(
                                      min_curve_span_ratio=0.15)
     _save_debug("preprocess_no_text", binary.astype(np.uint8) * 255)
 
-    # Remove axis remnants at borders
-    binary = _remove_border_lines(binary, border_px=5)
+    # 3. Remove tick marks near axes
+    binary = _remove_tick_marks(binary, rh, rw)
 
-    # Skeletonize
+    # 4. Morphological close AFTER cleaning (bridge gaps in curves only)
+    ck = np.ones(close_kernel_size, dtype=bool)
+    binary = binary_closing(binary, structure=ck, iterations=1)
+
+    # 5. Remove isolated single-pixel noise
+    padded = np.pad(binary.astype(np.uint8), 1, mode='constant')
+    neighbor_count = np.zeros((rh, rw), dtype=np.uint8)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            neighbor_count += padded[1 + dy:rh + 1 + dy,
+                                     1 + dx:rw + 1 + dx]
+    binary[binary & (neighbor_count == 0)] = False
+
+    # 6. Remove axis remnants at borders (reduced to 3px to avoid
+    #    clipping curve endpoints near the axis)
+    binary = _remove_border_lines(binary, border_px=3)
+
+    # 7. Skeletonize
     skeleton = _skeletonize(binary)
     _save_debug("preprocess_skeleton", skeleton.astype(np.uint8) * 255)
 
@@ -408,6 +446,205 @@ def _remove_border_lines(binary: np.ndarray, border_px: int = 5) -> np.ndarray:
     return result
 
 
+# ====================================================================
+# 2b. Robust gridline removal (morphological)
+# ====================================================================
+
+def _remove_gridlines_morph(
+    binary: np.ndarray,
+    img_h: int,
+    img_w: int,
+    *,
+    h_kernel_ratio: float = 0.20,
+    v_kernel_ratio: float = 0.20,
+    fill_threshold: float = 0.80,
+    protect_curves: bool = True,
+) -> np.ndarray:
+    """Remove gridlines using morphological opening with line kernels.
+
+    Strategy:
+      1. Detect horizontal lines via opening with (1, K_h) kernel.
+      2. Detect vertical lines via opening with (K_v, 1) kernel.
+      3. Create grid mask from detected lines.
+      4. If *protect_curves*: keep pixels where curves cross gridlines
+         (prevents 1-pixel gaps in curves at grid crossings).
+      5. Subtract grid mask from binary.
+      6. Fallback: also clear any rows/cols with >80 % fill.
+
+    This is superior to the simple fill-ratio approach because it
+    targets actual long straight lines rather than clearing entire
+    rows/columns (which damages curves that happen to run
+    horizontally).
+
+    Parameters
+    ----------
+    binary : np.ndarray (bool)
+        Binarized plot-area image.
+    img_h, img_w : int
+        Dimensions of the binary image.
+    h_kernel_ratio : float
+        Horizontal kernel length as fraction of image width.
+    v_kernel_ratio : float
+        Vertical kernel length as fraction of image height.
+    fill_threshold : float
+        Fallback: clear rows/cols with fill ratio above this.
+    protect_curves : bool
+        If True, preserve curve pixels at grid crossings.
+
+    Returns
+    -------
+    np.ndarray (bool)
+        Binary with gridlines removed.
+    """
+    result = binary.copy()
+
+    # Minimum kernel length for reliable line detection
+    h_klen = max(25, int(img_w * h_kernel_ratio))
+    v_klen = max(25, int(img_h * v_kernel_ratio))
+
+    # Detect horizontal grid lines
+    h_kernel = np.ones((1, h_klen), dtype=bool)
+    h_lines = binary_opening(binary, structure=h_kernel, iterations=1)
+
+    # Detect vertical grid lines
+    v_kernel = np.ones((v_klen, 1), dtype=bool)
+    v_lines = binary_opening(binary, structure=v_kernel, iterations=1)
+
+    # Filter: only keep detections that span ≥ 85 % of full width/height.
+    # This prevents shallow curves from being misidentified as grid lines.
+    SPAN_RATIO = 0.85
+    if h_lines.any():
+        for r in range(img_h):
+            row_d = h_lines[r, :]
+            if not row_d.any():
+                continue
+            c = np.where(row_d)[0]
+            if (c[-1] - c[0] + 1) < img_w * SPAN_RATIO:
+                h_lines[r, :] = False
+
+    if v_lines.any():
+        for c in range(img_w):
+            col_d = v_lines[:, c]
+            if not col_d.any():
+                continue
+            rows = np.where(col_d)[0]
+            if (rows[-1] - rows[0] + 1) < img_h * SPAN_RATIO:
+                v_lines[:, c] = False
+
+    grid_mask = h_lines | v_lines
+
+    if protect_curves and grid_mask.any():
+        # Find non-grid foreground pixels
+        non_grid = binary & ~grid_mask
+        if non_grid.any():
+            # Dilate non-grid pixels to mark "curve vicinity"
+            struct3 = np.ones((3, 3), dtype=bool)
+            curve_vicinity = binary_dilation(
+                non_grid, structure=struct3, iterations=1,
+            )
+            # Protect grid pixels that sit in curve vicinity
+            # (these are curve–grid crossing points)
+            protection = grid_mask & curve_vicinity
+            grid_mask = grid_mask & ~protection
+
+    result[grid_mask] = False
+    _save_debug("gridlines_morph_removed", result.astype(np.uint8) * 255)
+
+    # Fallback: also catch lighter grids via fill-ratio
+    row_fill = result.sum(axis=1) / max(img_w, 1)
+    result[row_fill > fill_threshold, :] = False
+    col_fill = result.sum(axis=0) / max(img_h, 1)
+    result[:, col_fill > fill_threshold] = False
+
+    return result
+
+
+# ====================================================================
+# 2c. Tick mark removal
+# ====================================================================
+
+def _remove_tick_marks(
+    binary: np.ndarray,
+    img_h: int,
+    img_w: int,
+    *,
+    max_length: int = 20,
+    max_thickness: int = 5,
+    proximity: int = 12,
+) -> np.ndarray:
+    """Remove tick marks near axes (short perpendicular lines at edges).
+
+    Tick marks are small line segments near the borders of the plot area
+    that are perpendicular to the axes.  They typically appear at the
+    left/bottom edges where axis ticks protrude into the plot.
+
+    Only removes small components whose bounding box fits within
+    *max_length* × *max_thickness* and that touch an edge within
+    *proximity* pixels.  This is safe for curves because real curves
+    are much larger and span far from the edges.
+
+    Parameters
+    ----------
+    binary : np.ndarray (bool)
+    img_h, img_w : int
+    max_length : int
+        Maximum extent of a tick mark in its long dimension.
+    max_thickness : int
+        Maximum extent in the perpendicular dimension.
+    proximity : int
+        Maximum distance from the plot edge to qualify as a tick.
+
+    Returns
+    -------
+    np.ndarray (bool)
+    """
+    structure = np.ones((3, 3), dtype=int)
+    labelled, n_comp = ndimage_label(binary, structure=structure)
+
+    if n_comp == 0:
+        return binary
+
+    result = binary.copy()
+
+    for comp_id in range(1, n_comp + 1):
+        comp_mask = labelled == comp_id
+        ys, xs = np.where(comp_mask)
+        if len(ys) < 2:
+            continue
+
+        bbox_h = int(ys.max() - ys.min()) + 1
+        bbox_w = int(xs.max() - xs.min()) + 1
+
+        # Check proximity to edges
+        near_left = int(xs.min()) < proximity
+        near_right = int(xs.max()) > img_w - proximity
+        near_top = int(ys.min()) < proximity
+        near_bottom = int(ys.max()) > img_h - proximity
+
+        if not (near_left or near_right or near_top or near_bottom):
+            continue
+
+        # Tick at left/right edge: short horizontal, thin vertical
+        if (near_left or near_right):
+            if bbox_w <= max_length and bbox_h <= max_thickness:
+                result[comp_mask] = False
+                continue
+
+        # Tick at top/bottom edge: short vertical, thin horizontal
+        if (near_top or near_bottom):
+            if bbox_h <= max_length and bbox_w <= max_thickness:
+                result[comp_mask] = False
+                continue
+
+        # Small blob very close to edge
+        area = int(comp_mask.sum())
+        if area <= max_length * max_thickness:
+            if bbox_w <= max_length and bbox_h <= max_length:
+                result[comp_mask] = False
+
+    return result
+
+
 def _skeletonize(binary: np.ndarray) -> np.ndarray:
     """Thin binary image to 1-pixel skeleton."""
     try:
@@ -459,6 +696,146 @@ def _otsu_threshold(gray: np.ndarray) -> int:
             max_var = var_between
             best_t = t
     return max(40, min(best_t, 200))
+
+
+# ====================================================================
+# 2b. Enhanced preprocessing helpers (CLAHE, blackhat, adaptive, Hough)
+# ====================================================================
+
+
+def _apply_clahe(
+    gray: np.ndarray, clip_limit: float, tile_size: Tuple[int, int],
+) -> np.ndarray:
+    """Apply CLAHE contrast normalization.
+
+    Tries OpenCV first (faster), falls back to scikit-image.
+    """
+    try:
+        import cv2  # type: ignore
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_size)
+        return clahe.apply(gray)
+    except Exception:
+        pass
+    try:
+        from skimage.exposure import equalize_adapthist
+        gray_f = gray.astype(np.float64) / 255.0
+        # skimage clip_limit is on a different scale; convert
+        sk_clip = max(clip_limit / 100.0, 0.005)
+        enhanced = equalize_adapthist(
+            gray_f, clip_limit=sk_clip, kernel_size=tile_size,
+        )
+        return (enhanced * 255).astype(np.uint8)
+    except Exception as exc:
+        logger.debug("CLAHE unavailable, skipping: %s", exc)
+        return gray
+
+
+def _apply_blackhat(
+    gray: np.ndarray, kernel_size: Tuple[int, int],
+) -> np.ndarray:
+    """Black-hat transform to highlight dark strokes on light background.
+
+    blackhat = closing(gray) - gray
+    """
+    closed = grey_closing(gray, size=kernel_size)
+    bh = closed.astype(np.int16) - gray.astype(np.int16)
+    bh = np.clip(bh, 0, 255).astype(np.uint8)
+    # Only use if it reveals meaningful contrast
+    if bh.max() > 30:
+        return bh
+    logger.debug("blackhat max=%d too low, keeping original", bh.max())
+    return gray
+
+
+def _adaptive_threshold(
+    gray: np.ndarray, block_size: int, C: int,
+) -> np.ndarray:
+    """Adaptive threshold using local-mean comparison (no OpenCV needed)."""
+    local_mean = uniform_filter(gray.astype(np.float64), size=block_size)
+    return gray < (local_mean - C)
+
+
+def _remove_lines_hough(
+    binary: np.ndarray,
+    img_h: int,
+    img_w: int,
+    config: BWPipelineConfig,
+) -> np.ndarray:
+    """Remove long straight lines (axes/gridlines) via Hough transform."""
+    try:
+        from skimage.transform import probabilistic_hough_line
+    except ImportError:
+        logger.debug("skimage Hough unavailable, skipping")
+        return binary
+
+    edges = binary.astype(np.uint8)
+    min_len = max(config.hough_min_line_length, int(min(img_h, img_w) * 0.3))
+
+    lines = probabilistic_hough_line(
+        edges,
+        threshold=config.hough_threshold,
+        line_length=min_len,
+        line_gap=config.hough_max_line_gap,
+    )
+    if not lines:
+        return binary
+
+    result = binary.copy()
+    margin = 5  # pixels from border considered "axis"
+
+    for (x0, y0), (x1, y1) in lines:
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        length = math.sqrt(dx * dx + dy * dy)
+
+        # Only remove near-horizontal or near-vertical lines
+        if dx > 0 and dy > 0:
+            angle = math.atan2(dy, dx)
+            if 0.1 < angle < (math.pi / 2 - 0.1):
+                continue  # diagonal — skip
+
+        is_removable = False
+
+        if dy <= 3:  # horizontal
+            if length > img_w * 0.5:
+                y_mid = (y0 + y1) // 2
+                if y_mid < margin or y_mid > img_h - margin:
+                    is_removable = True
+                elif length > img_w * 0.7:
+                    is_removable = True
+        elif dx <= 3:  # vertical
+            if length > img_h * 0.5:
+                x_mid = (x0 + x1) // 2
+                if x_mid < margin or x_mid > img_w - margin:
+                    is_removable = True
+                elif length > img_h * 0.7:
+                    is_removable = True
+
+        if is_removable:
+            _rasterize_line_remove(result, x0, y0, x1, y1, thickness=3)
+
+    logger.debug("Hough removed %d/%d lines",
+                 sum(1 for _ in lines if True), len(lines))
+    return result
+
+
+def _rasterize_line_remove(
+    binary: np.ndarray, x0: int, y0: int, x1: int, y1: int,
+    thickness: int = 3,
+) -> None:
+    """Erase a line from *binary* in-place using Bresenham rasterisation."""
+    h, w = binary.shape
+    n = max(abs(x1 - x0), abs(y1 - y0), 1)
+    half = thickness // 2
+    for t in range(n + 1):
+        frac = t / n
+        cx = int(round(x0 + frac * (x1 - x0)))
+        cy = int(round(y0 + frac * (y1 - y0)))
+        for dy in range(-half, half + 1):
+            for dx in range(-half, half + 1):
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < h and 0 <= nx < w:
+                    binary[ny, nx] = False
 
 
 # ====================================================================
@@ -1360,6 +1737,295 @@ def order_pixels_to_polyline(
 
 
 # ====================================================================
+# 8b. Column-scan multi-curve extraction
+# ====================================================================
+
+def _column_scan_extract(
+    binary: np.ndarray,
+    num_curves: int = 5,
+    *,
+    max_y_jump: int = 0,
+    min_track_width: int = 0,
+    max_x_gap: int = 0,
+    min_coverage: float = 0.40,
+    max_slope: float = 3.0,
+) -> Dict[int, List[Tuple[int, int]]]:
+    """Extract curves from a binary image using column-scan tracking.
+
+    Scans each column left-to-right, finds vertical runs of dark pixels,
+    and tracks their centroids across columns.  Uses slope prediction to
+    correctly separate overlapping curves.
+
+    This method naturally handles:
+      - Multiple overlapping solid curves (different y positions)
+      - Curve crossings (tracks maintain identity through crossings
+        via slope prediction)
+      - Small gaps (tracks coast through using predicted slope)
+
+    Parameters
+    ----------
+    binary : np.ndarray (bool)
+        Cleaned binary mask (text, grid already removed).
+    num_curves : int
+        Expected number of curves (upper bound for output).
+    max_y_jump : int
+        Max y deviation from predicted position.  0 = auto.
+    min_track_width : int
+        Min horizontal span for a valid track.  0 = auto.
+    max_x_gap : int
+        Max columns without a match before a track goes stale.  0 = auto.
+    min_coverage : float
+        Min fraction of x-span that must have data.
+    max_slope : float
+        Max y_span / x_span ratio (reject near-vertical tracks).
+
+    Returns
+    -------
+    Dict[int, List[(x, y)]]
+        Curve index → ordered (x, y) pixel coordinates (region-local).
+    """
+    rh, rw = binary.shape
+
+    # Auto-compute parameters from image dimensions
+    if max_y_jump <= 0:
+        max_y_jump = max(8, int(rh * 0.03))
+    if min_track_width <= 0:
+        min_track_width = max(10, int(rw * 0.15))
+    if max_x_gap <= 0:
+        max_x_gap = max(20, int(rw * 0.10))
+
+    # --- Step 1: Find dark-pixel runs in every column ---
+    RUN_GAP = max(3, int(rh * 0.005))
+    column_runs: Dict[int, list] = {}
+
+    for x in range(rw):
+        dark_y = np.where(binary[:, x])[0]
+        if len(dark_y) == 0:
+            continue
+        runs = []
+        start = dark_y[0]
+        for i in range(1, len(dark_y)):
+            if dark_y[i] - dark_y[i - 1] > RUN_GAP:
+                runs.append((start, dark_y[i - 1]))
+                start = dark_y[i]
+        runs.append((start, dark_y[-1]))
+        column_runs[x] = [
+            (int((r[0] + r[1]) // 2), int(r[0]), int(r[1])) for r in runs
+        ]
+
+    if not column_runs:
+        return {}
+
+    # --- Step 2: Slope-predicting nearest-neighbor tracker ---
+    SLOPE_WINDOW = 5
+    tracks: list = []
+    track_last_x: list = []
+    track_last_y: list = []
+    track_slope: list = []
+
+    def _estimate_slope(track_pts):
+        if len(track_pts) < 2:
+            return 0.0
+        recent = track_pts[-SLOPE_WINDOW:]
+        if len(recent) < 2:
+            return 0.0
+        dx = recent[-1][0] - recent[0][0]
+        dy = recent[-1][1] - recent[0][1]
+        return dy / dx if dx != 0 else 0.0
+
+    for x in sorted(column_runs.keys()):
+        centroids = [r[0] for r in column_runs[x]]
+        if not tracks:
+            for cy in centroids:
+                tracks.append([(x, cy)])
+                track_last_x.append(x)
+                track_last_y.append(cy)
+                track_slope.append(0.0)
+            continue
+
+        # Match centroids to existing tracks
+        used_tracks: set = set()
+        used_cents: set = set()
+        pairs = []
+        for ci, cy in enumerate(centroids):
+            for ti in range(len(tracks)):
+                x_gap = x - track_last_x[ti]
+                if x_gap > max_x_gap:
+                    continue
+                predicted_y = track_last_y[ti] + track_slope[ti] * x_gap
+                dist = abs(cy - predicted_y)
+                if dist <= max_y_jump:
+                    pairs.append((dist, ci, ti))
+        pairs.sort()
+
+        for dist, ci, ti in pairs:
+            if ci in used_cents or ti in used_tracks:
+                continue
+            tracks[ti].append((x, centroids[ci]))
+            track_last_x[ti] = x
+            track_last_y[ti] = centroids[ci]
+            track_slope[ti] = _estimate_slope(tracks[ti])
+            used_cents.add(ci)
+            used_tracks.add(ti)
+
+        # Unmatched centroids → new tracks
+        for ci, cy in enumerate(centroids):
+            if ci not in used_cents:
+                tracks.append([(x, cy)])
+                track_last_x.append(x)
+                track_last_y.append(cy)
+                track_slope.append(0.0)
+
+    # --- Step 3: Running-median smoothing ---
+    SMOOTH_HALF = 5
+    SMOOTH_THR = max(6, int(rh * 0.015))
+    smoothed_tracks: list = []
+    for t in tracks:
+        if len(t) < SMOOTH_HALF * 2 + 1:
+            smoothed_tracks.append(t)
+            continue
+        arr = np.array(t)
+        ys = arr[:, 1].astype(float)
+        keep = np.ones(len(ys), dtype=bool)
+        for i in range(len(ys)):
+            lo = max(0, i - SMOOTH_HALF)
+            hi = min(len(ys), i + SMOOTH_HALF + 1)
+            med = np.median(ys[lo:hi])
+            if abs(ys[i] - med) > SMOOTH_THR:
+                keep[i] = False
+        cleaned = arr[keep]
+        if len(cleaned) >= 5:
+            smoothed_tracks.append([(int(p[0]), int(p[1])) for p in cleaned])
+        else:
+            smoothed_tracks.append(t)
+    tracks = smoothed_tracks
+
+    # --- Step 4: Filter tracks ---
+    valid_tracks = []
+    for t in tracks:
+        xs_t = [p[0] for p in t]
+        ys_t = [p[1] for p in t]
+        x_span = max(xs_t) - min(xs_t) if xs_t else 0
+        y_span = (max(ys_t) - min(ys_t)) if ys_t else 0
+
+        if x_span < min_track_width:
+            continue
+
+        slope = y_span / max(x_span, 1)
+        if slope > max_slope:
+            continue
+
+        unique_x = len(set(xs_t))
+        coverage = unique_x / max(x_span, 1)
+        if coverage < min_coverage:
+            continue
+
+        valid_tracks.append(t)
+
+    # --- Step 5: Rank and limit ---
+    def _track_score(t):
+        xs_t = [p[0] for p in t]
+        x_span = max(xs_t) - min(xs_t)
+        unique_x = len(set(xs_t))
+        return x_span * (unique_x / max(x_span, 1))
+
+    valid_tracks.sort(key=_track_score, reverse=True)
+    if len(valid_tracks) > num_curves:
+        valid_tracks = valid_tracks[:num_curves]
+
+    # Sort by mean y (topmost first)
+    valid_tracks.sort(key=lambda t: float(np.mean([p[1] for p in t])))
+
+    result: Dict[int, List[Tuple[int, int]]] = {}
+    for idx, track in enumerate(valid_tracks):
+        result[idx] = track
+
+    logger.debug("_column_scan_extract: found %d tracks", len(result))
+    return result
+
+
+# ====================================================================
+# 8c. Curve exclusion filter
+# ====================================================================
+
+def _exclude_curve_filter(
+    curves: Dict[int, List[Tuple[int, int]]],
+    mode: str,
+) -> Dict[int, List[Tuple[int, int]]]:
+    """Exclude one curve based on a configurable heuristic.
+
+    Use this to remove a "surge line" or other reference line from
+    the extracted curves without hardcoding image-specific rules.
+
+    Modes
+    -----
+    topmost     – exclude the curve with lowest mean y (highest on screen)
+    bottommost  – exclude the curve with highest mean y
+    steepest    – exclude the curve with largest y_span / x_span ratio
+    longest     – exclude the curve with largest x_span
+    thickest    – exclude the curve with most pixels
+
+    Parameters
+    ----------
+    curves : Dict[int, List[(x, y)]]
+    mode : str
+        One of the modes above, or '' (no-op).
+
+    Returns
+    -------
+    Dict[int, List[(x, y)]]
+        Re-indexed dict with the excluded curve removed.
+    """
+    if not mode or len(curves) <= 1:
+        return curves
+
+    mode = mode.lower().strip()
+    valid_modes = ("topmost", "bottommost", "steepest", "longest", "thickest")
+    if mode not in valid_modes:
+        logger.warning("_exclude_curve_filter: unknown mode '%s'", mode)
+        return curves
+
+    scores: Dict[int, float] = {}
+    for idx, pixels in curves.items():
+        if not pixels:
+            continue
+        xs = [p[0] for p in pixels]
+        ys = [p[1] for p in pixels]
+        mean_y = float(np.mean(ys))
+        x_span = max(xs) - min(xs)
+        y_span = max(ys) - min(ys)
+        slope = y_span / max(x_span, 1)
+
+        if mode == "topmost":
+            scores[idx] = -mean_y
+        elif mode == "bottommost":
+            scores[idx] = mean_y
+        elif mode == "steepest":
+            scores[idx] = slope
+        elif mode == "longest":
+            scores[idx] = float(x_span)
+        elif mode == "thickest":
+            scores[idx] = float(len(pixels))
+
+    if not scores:
+        return curves
+
+    exclude_idx = max(scores, key=scores.get)  # type: ignore[arg-type]
+    logger.info(
+        "_exclude_curve_filter: excluding curve %d (mode=%s, score=%.2f)",
+        exclude_idx, mode, scores[exclude_idx],
+    )
+
+    # Rebuild without the excluded curve, re-indexing from 0
+    remaining = {k: v for k, v in curves.items() if k != exclude_idx}
+    result: Dict[int, List[Tuple[int, int]]] = {}
+    for new_idx, (_, pixels) in enumerate(sorted(remaining.items())):
+        result[new_idx] = pixels
+
+    return result
+
+
+# ====================================================================
 # 9. Full B/W extraction pipeline
 # ====================================================================
 
@@ -1374,16 +2040,19 @@ def extract_bw_curves(
     text_threshold: float = 0.50,
     smoothing_strength: int = 0,
     extend_ends: bool = True,
+    exclude_curve_mode: str = "",
+    config: Optional[BWPipelineConfig] = None,
 ) -> Dict[int, List[Tuple[int, int]]]:
     """Full B/W curve extraction pipeline.
 
     Pipeline:
-      1. Preprocess (binarize, remove text, skeletonize)
-      2. SOFT score all components (no destructive deletion)
-      3. If anchors: trace between anchors using A* with distance-transform
-         Else: iterative multi-curve selection (select, mask, repeat)
-      4. Extend curve endpoints toward boundaries
-      5. Smooth the output
+      1. Preprocess (binarize, remove grid/text/ticks, skeletonize)
+      2. If anchors: trace between anchors using A* with distance-transform
+         Else: column-scan multi-curve extraction on cleaned binary
+         Fallback: iterative skeleton component selection
+      3. Extend curve endpoints toward boundaries
+      4. Smooth the output
+      5. Optionally exclude one curve (surge line filter)
 
     Parameters
     ----------
@@ -1400,33 +2069,30 @@ def extract_bw_curves(
     text_threshold : float
         Threshold for text-score soft penalty.
     smoothing_strength : int
-        Savitzky-Golay window (0 = auto).
+        Savitzky-Golay window (0 = auto, -1 = disabled).
     extend_ends : bool
         Whether to extend curve endpoints.
+    exclude_curve_mode : str
+        If non-empty, exclude one curve by mode:
+        'topmost', 'bottommost', 'steepest', 'longest', 'thickest'.
+        Use 'steepest' to remove a surge line.
 
     Returns
     -------
     Dict[int, List[(x, y)]]
         Curve index → pixel coords in full-image space.
     """
+    cfg = config or DEFAULT_CONFIG
     p_left, p_top, p_right, p_bottom = plot_area
 
-    # Step 1: Preprocess
-    skeleton, binary, adj_area = preprocess_bw(image, plot_area)
+    # Step 1: Preprocess (enhanced with CLAHE, blackhat, adaptive, Hough)
+    skeleton, binary, adj_area = preprocess_bw(image, plot_area, config=cfg)
     rh, rw = skeleton.shape
-
-    # NOTE: We do NOT call filter_dashed_components() here.
-    # Dashed/text scoring is SOFT inside select_best_curves —
-    # components are down-ranked, not destroyed.
-    # This preserves real curves that may have been lost before.
 
     # Pre-compute distance transform on binary for anchor tracing
     dt = distance_transform_edt(binary)
 
     # Step 2: Extract curves (hybrid)
-    # - If anchors are provided, trace those first.
-    # - Then auto-extract remaining curves so partial anchors still
-    #   produce the full curve set.
     result: Dict[int, List[Tuple[int, int]]] = {}
     target = max(num_curves, 1)
     working_skeleton = skeleton.copy()
@@ -1438,6 +2104,42 @@ def extract_bw_curves(
                     ny, nx = py + dy, px + dx
                     if 0 <= ny < rh and 0 <= nx < rw:
                         mask_img[ny, nx] = False
+
+    # ── Step 2-pre: DP-based ordered multi-curve extraction ──
+    #    Extracts non-crossing curves via sequential DP with exclusion bands.
+    #    Skip when anchors are provided – anchor-guided tracing is more precise.
+    if not anchors:
+        try:
+            from core.dp_tracker import extract_curves_dp
+
+            dp_curves, dp_debug = extract_curves_dp(
+                binary, skeleton, target,
+                max_jump=0,          # auto
+                jump_weight=0.3,
+                curvature_weight=0.1,
+                min_span_ratio=0.25,
+            )
+            if dp_curves:
+                for idx, pixels in dp_curves.items():
+                    result[idx] = [(x + p_left, y + p_top)
+                                   for x, y in pixels]
+                    _mask_pixels(working_skeleton, pixels, radius=2)
+                logger.info(
+                    "extract_bw_curves: DP tracker produced %d curves",
+                    len(dp_curves),
+                )
+                # Save debug overlay when requested
+                if cfg.debug_bw and cfg.debug_bw_dir:
+                    try:
+                        from core.reconstruction import render_dp_debug
+                        render_dp_debug(
+                            np.array(image), plot_area, skeleton,
+                            dp_curves, dp_debug, cfg.debug_bw_dir,
+                        )
+                    except Exception as dbg_err:
+                        logger.debug("DP debug overlay failed: %s", dbg_err)
+        except Exception as dp_err:
+            logger.warning("DP tracker failed, falling back: %s", dp_err)
 
     # 2a) Anchor-guided tracing (if provided)
     if anchors:
@@ -1459,48 +2161,129 @@ def extract_bw_curves(
             full_path = [(x + p_left, y + p_top) for x, y in path]
             result[idx] = full_path
 
-            # Remove traced path from working skeleton so auto-pass finds
-            # other curves instead of duplicating this one.
+            # Remove traced path from working skeleton
             _mask_pixels(working_skeleton, path, radius=2)
 
-    # 2b) Iterative multi-curve extraction for any remaining curves
-    # 1. Extract components, pick the best one
-    # 2. Mask its pixels from skeleton
-    # 3. Repeat until we have enough curves or no good candidates remain
-    max_rounds = target + 3  # allow a few extra rounds for safety
+    # 2b) Iterative skeleton component selection (proven primary method)
+    remaining = target - len(result)
+    if remaining > 0:
+        max_rounds = remaining + 3
+        for _round in range(max_rounds):
+            if len(result) >= target:
+                break
 
-    for _round in range(max_rounds):
-        if len(result) >= target:
-            break
+            components = extract_skeleton_components(working_skeleton)
+            if not components:
+                break
 
-        components = extract_skeleton_components(working_skeleton)
-        if not components:
-            break
+            selected = select_best_curves(
+                components, 1,
+                dashed_threshold=dashed_threshold,
+                text_threshold=text_threshold,
+                ignore_dashed=ignore_dashed,
+                auto_detect=False,
+            )
+            if not selected:
+                break
 
-        selected = select_best_curves(
-            components, 1,
-            dashed_threshold=dashed_threshold,
-            text_threshold=text_threshold,
-            ignore_dashed=ignore_dashed,
-            auto_detect=False,
-        )
-        if not selected:
-            break
+            comp = selected[0]
+            idx = len(result)
+            raw_pixels = comp["pixels"]
+            ordered = order_pixels_to_polyline(raw_pixels)
+            full_pixels = [(x + p_left, y + p_top) for x, y in ordered]
+            result[idx] = full_pixels
 
-        comp = selected[0]
-        idx = len(result)
-        raw_pixels = comp["pixels"]
-        ordered = order_pixels_to_polyline(raw_pixels)
-        full_pixels = [(x + p_left, y + p_top) for x, y in ordered]
-        result[idx] = full_pixels
+            _mask_pixels(working_skeleton, raw_pixels, radius=2)
 
-        # Mask this curve's pixels (+ small dilation) from working skeleton
-        _mask_pixels(working_skeleton, raw_pixels, radius=2)
+            logger.debug(
+                "Skeleton extraction round %d: component %d px, x_span=%d",
+                _round, comp["area"], comp["x_span"],
+            )
 
-        logger.debug(
-            "Iterative extraction round %d: picked component with %d px, x_span=%d",
-            _round, comp["area"], comp["x_span"],
-        )
+    # 2c) Column-scan fallback: if skeleton components didn't find enough
+    #     curves (e.g., overlapping curves in one connected component),
+    #     use the column-scan tracker on the cleaned binary.
+    remaining = target - len(result)
+    if remaining > 0:
+        work_binary = binary.copy()
+        for idx_exist in result:
+            local_pxs = [(x - p_left, y - p_top) for x, y in result[idx_exist]]
+            _mask_pixels(work_binary, local_pxs, radius=3)
+
+        scanned = _column_scan_extract(work_binary, remaining)
+        for scan_idx, pixels in sorted(scanned.items()):
+            if len(result) >= target:
+                break
+            idx = len(result)
+            full_pixels = [(x + p_left, y + p_top) for x, y in pixels]
+            result[idx] = full_pixels
+
+        if scanned:
+            logger.debug(
+                "Column-scan fallback found %d additional curve(s)",
+                len(scanned),
+            )
+
+    # 2d) Geometry sanity filter: remove likely non-curve tracks
+    #      (e.g., near-vertical reference/flow lines) and keep best tracks.
+    if result:
+        def _track_stats(pixels: List[Tuple[int, int]]) -> Dict[str, float]:
+            xs = np.array([p[0] for p in pixels], dtype=np.float64)
+            ys = np.array([p[1] for p in pixels], dtype=np.float64)
+            if len(xs) == 0:
+                return {
+                    "x_span": 0.0,
+                    "y_span": 0.0,
+                    "coverage": 0.0,
+                    "slope_ratio": 0.0,
+                    "score": 0.0,
+                }
+            x_span = float(xs.max() - xs.min())
+            y_span = float(ys.max() - ys.min())
+            coverage = float(len(np.unique(xs.astype(int))) / max(x_span, 1.0))
+            slope_ratio = float(y_span / max(x_span, 1.0))
+            score = x_span * coverage
+            return {
+                "x_span": x_span,
+                "y_span": y_span,
+                "coverage": coverage,
+                "slope_ratio": slope_ratio,
+                "score": score,
+            }
+
+        # Hard reject obvious non-curves
+        all_items: List[Tuple[int, List[Tuple[int, int]], Dict[str, float]]] = []
+        filtered_items: List[Tuple[int, List[Tuple[int, int]], Dict[str, float]]] = []
+        rejected_items: List[Tuple[int, List[Tuple[int, int]], Dict[str, float]]] = []
+        for idx, pixels in result.items():
+            st = _track_stats(pixels)
+            all_items.append((idx, pixels, st))
+            if st["x_span"] < rw * 0.20:
+                rejected_items.append((idx, pixels, st))
+                continue
+            if st["coverage"] < 0.18:
+                rejected_items.append((idx, pixels, st))
+                continue
+            # Very steep + not wide enough -> likely reference/flow line
+            if st["slope_ratio"] > 1.2 and st["x_span"] < rw * 0.70:
+                rejected_items.append((idx, pixels, st))
+                continue
+            filtered_items.append((idx, pixels, st))
+
+        if filtered_items:
+            # If too few survive, backfill with best rejected tracks.
+            if len(filtered_items) < target and rejected_items:
+                rejected_items.sort(key=lambda t: t[2]["score"], reverse=True)
+                need = target - len(filtered_items)
+                filtered_items.extend(rejected_items[:need])
+
+            # If still over target, keep the strongest spanning tracks
+            filtered_items.sort(key=lambda t: t[2]["score"], reverse=True)
+            filtered_items = filtered_items[:target]
+            result = {i: px for i, (_, px, _) in enumerate(filtered_items)}
+        else:
+            # If all were filtered out, keep original as safety fallback
+            logger.debug("Geometry sanity filter dropped all tracks; keeping original set")
 
     # Step 3: Extend curves toward boundaries (skip if anchors given —
     #          the user's anchors define exact bounds)
@@ -1530,6 +2313,18 @@ def extract_bw_curves(
                 smoothed_int[0] = first_pt
                 smoothed_int[-1] = last_pt
             result[idx] = smoothed_int
+
+    # Step 5: Exclude one curve if requested (e.g., surge line)
+    if exclude_curve_mode:
+        result = _exclude_curve_filter(result, exclude_curve_mode)
+
+    # Step 6: Re-index by mean y (topmost first) for consistent ordering
+    if len(result) > 1:
+        sorted_items = sorted(
+            result.items(),
+            key=lambda kv: float(np.mean([p[1] for p in kv[1]])) if kv[1] else 0,
+        )
+        result = {i: pixels for i, (_, pixels) in enumerate(sorted_items)}
 
     # ── Debug visualisation ──
     _save_bw_debug_overlay(

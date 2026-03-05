@@ -457,6 +457,7 @@ def _build_original_mask(img_array: np.ndarray, curves: Dict[str, Any]) -> np.nd
         isinstance(cd, dict) and cd.get("extraction_mode") == "grayscale"
         for cd in curves.values()
     )
+    has_colored_series = False  # default; overwritten in colour branch
 
     if any_grayscale:
         # ── grayscale mode: use stored pixel coordinates directly ──
@@ -597,3 +598,182 @@ def _draw_line_on_mask(
                 xx = x + dx
                 if 0 <= yy < h and 0 <= xx < w:
                     mask[yy, xx] = True
+
+
+# ====================================================================
+# BW graph debug overlay
+# ====================================================================
+
+# Distinct colours for up to 10 curves (RGB)
+_CURVE_COLORS_RGB = [
+    (255, 0, 0), (0, 200, 0), (0, 80, 255), (255, 165, 0),
+    (148, 0, 211), (0, 206, 209), (255, 20, 147), (128, 128, 0),
+    (0, 128, 128), (220, 20, 60),
+]
+
+
+def render_bw_graph_debug(
+    image_array: np.ndarray,
+    plot_area: Tuple[int, int, int, int],
+    skeleton: np.ndarray,
+    endpoints: List[Tuple[int, int]],
+    junctions: List[Tuple[int, int]],
+    curves: Dict[int, List[Tuple[int, int]]],
+    output_dir: str,
+) -> List[str]:
+    """Save debug overlay images for graph-based BW extraction.
+
+    Saved files (under *output_dir*):
+      - ``debug_skeleton.png``   skeleton on dark background
+      - ``debug_graph.png``      endpoints (green), junctions (red)
+      - ``debug_curves.png``     selected curves on original image
+
+    Returns list of saved file paths.
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    saved: List[str] = []
+    p_left, p_top, p_right, p_bottom = plot_area
+    crop_h, crop_w = skeleton.shape
+
+    # 1. Skeleton overlay --------------------------------------------------
+    try:
+        skel_img = np.zeros((crop_h, crop_w, 3), dtype=np.uint8)
+        skel_img[skeleton > 0] = (255, 255, 255)
+        Image.fromarray(skel_img).save(out / "debug_skeleton.png")
+        saved.append(str(out / "debug_skeleton.png"))
+    except Exception as exc:
+        logger.debug("skeleton overlay failed: %s", exc)
+
+    # 2. Endpoints + Junctions overlay ------------------------------------
+    try:
+        base = image_array[p_top:p_bottom, p_left:p_right].copy()
+        if base.ndim == 2:
+            base = np.stack([base] * 3, axis=-1)
+        base = base[:crop_h, :crop_w]
+        overlay = base.copy()
+        r = 3
+        for ex, ey in endpoints:
+            for dy in range(-r, r + 1):
+                for dx in range(-r, r + 1):
+                    ny, nx = ey + dy, ex + dx
+                    if 0 <= ny < crop_h and 0 <= nx < crop_w:
+                        overlay[ny, nx] = (0, 255, 0)
+        for jx, jy in junctions:
+            for dy in range(-r, r + 1):
+                for dx in range(-r, r + 1):
+                    ny, nx = jy + dy, jx + dx
+                    if 0 <= ny < crop_h and 0 <= nx < crop_w:
+                        overlay[ny, nx] = (255, 0, 0)
+        Image.fromarray(overlay).save(out / "debug_graph.png")
+        saved.append(str(out / "debug_graph.png"))
+    except Exception as exc:
+        logger.debug("graph overlay failed: %s", exc)
+
+    # 3. Selected curves overlay ------------------------------------------
+    try:
+        base2 = image_array.copy()
+        if base2.ndim == 2:
+            base2 = np.stack([base2] * 3, axis=-1)
+        ih, iw = base2.shape[:2]
+        for cidx, pixels in curves.items():
+            color = _CURVE_COLORS_RGB[cidx % len(_CURVE_COLORS_RGB)]
+            for px, py in pixels:
+                gx, gy = px + p_left, py + p_top
+                for dy in range(-1, 2):
+                    for dx in range(-1, 2):
+                        ny, nx = gy + dy, gx + dx
+                        if 0 <= ny < ih and 0 <= nx < iw:
+                            base2[ny, nx] = color
+        Image.fromarray(base2).save(out / "debug_curves.png")
+        saved.append(str(out / "debug_curves.png"))
+    except Exception as exc:
+        logger.debug("curves overlay failed: %s", exc)
+
+    logger.info("render_bw_graph_debug: saved %d overlays to %s",
+                len(saved), output_dir)
+    return saved
+
+
+def render_dp_debug(
+    image_array: np.ndarray,
+    plot_area: Tuple[int, int, int, int],
+    skeleton: np.ndarray,
+    curves: Dict[int, List[Tuple[int, int]]],
+    dp_debug: Dict[str, Any],
+    output_dir: str,
+) -> List[str]:
+    """Save debug overlay images for DP multi-curve extraction.
+
+    Saved files (under *output_dir*):
+      - ``debug_dp_likelihood.png``   likelihood map heatmap
+      - ``debug_dp_curves.png``       extracted DP paths on skeleton
+      - ``debug_dp_overlay.png``      DP paths overlaid on original image
+
+    Returns list of saved file paths.
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    saved: List[str] = []
+    p_left, p_top, p_right, p_bottom = plot_area
+    crop_h, crop_w = skeleton.shape[:2]
+
+    # 1. Likelihood map heatmap  -------------------------------------------
+    likelihood = dp_debug.get("likelihood")
+    if likelihood is not None:
+        try:
+            lm = np.array(likelihood, dtype=np.float64)
+            if lm.max() > 0:
+                lm = (lm / lm.max() * 255).astype(np.uint8)
+            else:
+                lm = np.zeros_like(lm, dtype=np.uint8)
+            # Apply a simple hot colormap
+            heat = np.zeros((*lm.shape, 3), dtype=np.uint8)
+            heat[..., 0] = lm              # R channel = likelihood
+            heat[..., 1] = (lm * 0.4).astype(np.uint8)
+            heat[..., 2] = 0
+            Image.fromarray(heat).save(out / "debug_dp_likelihood.png")
+            saved.append(str(out / "debug_dp_likelihood.png"))
+        except Exception as exc:
+            logger.debug("DP likelihood overlay failed: %s", exc)
+
+    # 2. DP paths on skeleton  (each curve in a different colour) ----------
+    try:
+        skel_img = np.zeros((crop_h, crop_w, 3), dtype=np.uint8)
+        skel_img[skeleton > 0] = (80, 80, 80)   # dim skeleton background
+        for cidx, pixels in curves.items():
+            color = _CURVE_COLORS_RGB[cidx % len(_CURVE_COLORS_RGB)]
+            for px, py in pixels:
+                for dy in range(-1, 2):
+                    for dx in range(-1, 2):
+                        ny, nx = py + dy, px + dx
+                        if 0 <= ny < crop_h and 0 <= nx < crop_w:
+                            skel_img[ny, nx] = color
+        Image.fromarray(skel_img).save(out / "debug_dp_curves.png")
+        saved.append(str(out / "debug_dp_curves.png"))
+    except Exception as exc:
+        logger.debug("DP curves overlay failed: %s", exc)
+
+    # 3. DP paths overlaid on original image  ------------------------------
+    try:
+        base = image_array.copy()
+        if base.ndim == 2:
+            base = np.stack([base] * 3, axis=-1)
+        ih, iw = base.shape[:2]
+        for cidx, pixels in curves.items():
+            color = _CURVE_COLORS_RGB[cidx % len(_CURVE_COLORS_RGB)]
+            for px, py in pixels:
+                gx, gy = px + p_left, py + p_top
+                for dy in range(-1, 2):
+                    for dx in range(-1, 2):
+                        ny, nx = gy + dy, gx + dx
+                        if 0 <= ny < ih and 0 <= nx < iw:
+                            base[ny, nx] = color
+        Image.fromarray(base).save(out / "debug_dp_overlay.png")
+        saved.append(str(out / "debug_dp_overlay.png"))
+    except Exception as exc:
+        logger.debug("DP overlay failed: %s", exc)
+
+    logger.info("render_dp_debug: saved %d overlays to %s",
+                len(saved), output_dir)
+    return saved

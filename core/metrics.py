@@ -476,3 +476,106 @@ def compute_series_regression(
                 series_name, int(result["n_points"]),
                 result["r2_score"], result["pearson_r"])
     return result
+
+
+# ====================================================================
+# BW-specific confidence signals
+# ====================================================================
+
+
+def compute_bw_confidence(
+    skeleton: np.ndarray,
+    binary: np.ndarray,
+    curves: Dict[int, List[Tuple[int, int]]],
+) -> Dict[str, Any]:
+    """Compute confidence / quality metrics specific to BW extraction.
+
+    Parameters
+    ----------
+    skeleton : (H, W) bool
+        Skeletonised binary image (plot-area crop).
+    binary : (H, W) bool
+        Cleaned binary image before skeletonisation.
+    curves : Dict[int, list of (x, y)]
+        Extracted curve pixel coords in **local** (crop) space.
+
+    Returns
+    -------
+    dict with keys:
+        bw_foreground_ratio   – fraction of True pixels in *binary*
+        bw_num_endpoints      – skeleton endpoints (degree-1 pixels)
+        bw_num_junctions      – skeleton junctions (degree-≥3 pixels)
+        bw_avg_curvature      – mean curvature across extracted curves
+        bw_total_path_length  – total pixel count in all curves
+        bw_overlap_ratio      – fraction of curve pixels shared by ≥2 curves
+    """
+    import math
+
+    h, w = binary.shape
+
+    # Foreground ratio
+    fg_ratio = float(binary.sum()) / max(binary.size, 1)
+
+    # Skeleton node classification via 8-neighbour degree
+    skel = skeleton.astype(bool)
+    nbr_count = np.zeros_like(skel, dtype=np.int32)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            shifted = np.zeros_like(skel)
+            sy = max(0, dy)
+            ey = h + min(0, dy)
+            sx = max(0, dx)
+            ex = w + min(0, dx)
+            shifted[sy - dy:ey - dy, sx - dx:ex - dx] = skel[sy:ey, sx:ex]
+            nbr_count += shifted
+
+    endpoints = int(((nbr_count == 1) & skel).sum())
+    junctions = int(((nbr_count >= 3) & skel).sum())
+
+    # Per-curve curvature + total length
+    total_curv = 0.0
+    total_len = 0
+    n_curves_with_curv = 0
+    for pixels in curves.values():
+        total_len += len(pixels)
+        if len(pixels) < 5:
+            continue
+        step = max(1, len(pixels) // 60)
+        sampled = pixels[::step]
+        curve_curv = 0.0
+        for i in range(1, len(sampled) - 1):
+            x0, y0 = sampled[i - 1]
+            x1, y1 = sampled[i]
+            x2, y2 = sampled[i + 1]
+            dx1, dy1 = x1 - x0, y1 - y0
+            dx2, dy2 = x2 - x1, y2 - y1
+            l1 = math.sqrt(dx1 * dx1 + dy1 * dy1)
+            l2 = math.sqrt(dx2 * dx2 + dy2 * dy2)
+            if l1 < 1e-6 or l2 < 1e-6:
+                continue
+            cross = dx1 * dy2 - dy1 * dx2
+            dot = dx1 * dx2 + dy1 * dy2
+            curve_curv += abs(math.atan2(cross, dot))
+        total_curv += curve_curv
+        n_curves_with_curv += 1
+
+    avg_curv = total_curv / max(n_curves_with_curv, 1)
+
+    # Overlap ratio
+    pixel_counts: Dict[Tuple[int, int], int] = {}
+    for pixels in curves.values():
+        for pt in pixels:
+            pixel_counts[pt] = pixel_counts.get(pt, 0) + 1
+    shared = sum(1 for c in pixel_counts.values() if c >= 2)
+    overlap = shared / max(len(pixel_counts), 1)
+
+    return {
+        "bw_foreground_ratio": round(fg_ratio, 4),
+        "bw_num_endpoints": endpoints,
+        "bw_num_junctions": junctions,
+        "bw_avg_curvature": round(avg_curv, 4),
+        "bw_total_path_length": total_len,
+        "bw_overlap_ratio": round(overlap, 4),
+    }

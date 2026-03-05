@@ -26,6 +26,7 @@ from datetime import datetime
 
 from core.router import classify_image_mode
 from core.bw_pipeline import extract_bw_curves, smooth_curve
+from core.bw_fit import fit_bw_curve
 
 # ── Determinism: single-threaded BLAS/LAPACK ──────────────────────
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -1660,6 +1661,7 @@ class CurveDigitizer:
                            dashed_threshold: float = 0.45,
                            text_threshold: float = 0.50,
                            plot_area_override: Optional[Tuple[int, int, int, int]] = None,
+                           exclude_curve_mode: str = "",
                            ) -> Dict[str, Any]:
         """
         Complete end-to-end processing of a curve image.
@@ -1722,13 +1724,16 @@ class CurveDigitizer:
             # Filter GPT features: remove surge/reference/axis entries
             import re as _re
             _NON_CURVE_KW = {'surge', 'axis', 'boundary', 'limit',
-                             'reference', 'design', 'dashed'}
+                             'reference', 'design', 'dashed',
+                             'flow line', 'flowline', 'guide line', 'guideline'}
             curve_features = [
                 cf for cf in features['curves']
                 if not any(kw in cf.get('label', '').lower()
                            for kw in _NON_CURVE_KW)
                 and not _re.match(r'^[\d.,\s]+$',
                                   cf.get('label', '').strip())
+                and not _re.search(r'\bflow\b.*\bline\b|\bline\b.*\bflow\b',
+                                   cf.get('label', '').lower())
             ]
             
             num_curves = len(curve_features)
@@ -1748,6 +1753,7 @@ class CurveDigitizer:
                         text_threshold=text_threshold,
                         smoothing_strength=smoothing_strength,
                         extend_ends=True,
+                        exclude_curve_mode=exclude_curve_mode,
                     )
                     results['extraction_method'] = 'skeleton'
                 else:
@@ -1826,12 +1832,38 @@ class CurveDigitizer:
 
                 # ── Fit each grayscale cluster using the SAME logic as colour path ──
                 # normalize_to_axis → clean_coordinates_local → fit_polynomial_curve(degree=2)
-                for curve_idx, pixels in sorted(gray_clusters.items()):
-                    if curve_idx < len(curve_features_sorted):
-                        cf = curve_features_sorted[curve_idx]
-                        label = cf.get('label', f'Curve {curve_idx + 1}')
+                # Build stable cluster order for label assignment:
+                # use right-end extent (higher-speed curves usually extend further right).
+                cluster_items = sorted(gray_clusters.items())
+                if cluster_items:
+                    def _cluster_right_extent(pixels: List[Tuple[int, int]]) -> float:
+                        xs = [p[0] for p in pixels]
+                        if not xs:
+                            return 0.0
+                        return float(np.percentile(np.array(xs, dtype=np.float64), 95))
+
+                    cluster_order = [
+                        idx for idx, _ in sorted(
+                            cluster_items,
+                            key=lambda kv: _cluster_right_extent(kv[1]),
+                            reverse=True,
+                        )
+                    ]
+                else:
+                    cluster_order = []
+
+                label_by_cluster: Dict[int, str] = {}
+                for rank, cluster_idx in enumerate(cluster_order):
+                    if rank < len(curve_features_sorted):
+                        cf = curve_features_sorted[rank]
+                        label_by_cluster[cluster_idx] = cf.get(
+                            'label', f'Curve {cluster_idx + 1}'
+                        )
                     else:
-                        label = f'Curve {curve_idx + 1}'
+                        label_by_cluster[cluster_idx] = f'Curve {cluster_idx + 1}'
+
+                for curve_idx, pixels in cluster_items:
+                    label = label_by_cluster.get(curve_idx, f'Curve {curve_idx + 1}')
                     color_key = f'gray_{curve_idx}'
 
                     if len(pixels) < 2:
@@ -1845,19 +1877,12 @@ class CurveDigitizer:
                     # Normalize pixel coords → axis coords (same as colour path)
                     axis_coords = self.normalize_to_axis(pixels, width, height, plot_area)
 
-                    # Clean with shape-preserving local filter (same as colour path)
-                    cleaned_coords = self.clean_coordinates_local(axis_coords)
-
-                    # Iterative sigma-clip: fit degree-2, remove 2.5σ outliers, re-fit.
-                    # This catches stray points that the tracker picked up from
-                    # adjacent curves (which local-MAD might miss because they
-                    # appear as a gradual drift rather than a sudden spike).
-                    cleaned_coords = self._iterative_sigma_clip(cleaned_coords,
-                                                                degree=2, sigma=2.0,
-                                                                max_iter=5)
-
-                    # Polynomial fit degree 2 — parabolic (same as colour path)
-                    fit_result = self.fit_polynomial_curve(cleaned_coords, degree=2)
+                    # ── BW-specific robust polynomial fitting ──
+                    # Replaces the generic clean→sigma-clip→polyfit(2) pipeline
+                    # with binned-median centerline extraction, Hampel + sigma-clip
+                    # outlier removal, Savitzky-Golay pre-smooth, and BIC-selected
+                    # polynomial degree 2-4 with shape sanity checks.
+                    fit_result, cleaned_coords = fit_bw_curve(axis_coords)
 
                     # Quality metrics (same as colour path)
                     metrics = self.calculate_curve_metrics(cleaned_coords, fit_result)

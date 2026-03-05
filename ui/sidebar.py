@@ -149,6 +149,21 @@ def setup_sidebar() -> tuple:
                 "Use anchors", value=False, key="use_anchors",
             ) if n_anchor_rows > 0 else False
 
+        # Curve exclusion
+        with st.expander("Curve Exclusion", expanded=False):
+            st.caption(
+                "Optionally exclude one extracted curve by heuristic. "
+                "Use 'steepest' to remove a surge line."
+            )
+            exclude_curve_mode = st.selectbox(
+                "Exclude curve mode",
+                options=["", "steepest", "topmost", "bottommost",
+                         "longest", "thickest"],
+                index=0,
+                key="exclude_curve_mode",
+                help="Remove one curve matching this criterion.",
+            )
+
         # Debug toggle
         show_debug = st.checkbox(
             "Show debug overlay",
@@ -175,6 +190,7 @@ def setup_sidebar() -> tuple:
         "target_curves": target_curves,
         "dashed_threshold": dashed_threshold,
         "text_threshold": text_threshold,
+        "exclude_curve_mode": exclude_curve_mode if 'exclude_curve_mode' in dir() else "",
         "use_anchors": use_anchors if 'use_anchors' in dir() else False,
         "anchors": anchor_pairs if (use_anchors if 'use_anchors' in dir() else False) and anchor_pairs else None,
         "calibration_overrides": {},
