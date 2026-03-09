@@ -1220,6 +1220,72 @@ def select_best_curves(
 # 5. Anchor-guided A* tracing
 # ====================================================================
 
+
+def _normalize_anchors(
+    anchors: List,
+) -> List[List[Tuple[int, int]]]:
+    """Accept both legacy 2-point format and new multi-waypoint format.
+
+    Legacy: [((sx,sy),(ex,ey)), ...]  -> [[start, end], ...]
+    New:    [[(x1,y1),(x2,y2),...], ...] -> as-is
+    """
+    if not anchors:
+        return []
+    first = anchors[0]
+    # Legacy: list of 2-tuples of 2-tuples
+    if (isinstance(first, tuple) and len(first) == 2
+            and isinstance(first[0], tuple)):
+        return [[first[0], first[1]] for first in anchors]
+    # New: list of lists of tuples
+    if isinstance(first, (list, tuple)) and len(first) >= 2:
+        # Check if it's a list of points (each point is a 2-tuple of ints)
+        if isinstance(first[0], (list, tuple)) and len(first[0]) == 2:
+            return [[(int(p[0]), int(p[1])) for p in wps] for wps in anchors]
+    return []
+
+
+def trace_with_waypoints(
+    skeleton: np.ndarray,
+    waypoints: List[Tuple[int, int]],
+    *,
+    snap_radius: int = 20,
+    curvature_penalty: float = 2.0,
+    gap_bridge_max: int = 10,
+    gap_bridge_cost: float = 5.0,
+    distance_transform: Optional[np.ndarray] = None,
+) -> Optional[List[Tuple[int, int]]]:
+    """Trace a curve through multiple waypoints using A* between consecutive pairs.
+
+    Parameters
+    ----------
+    skeleton : np.ndarray (bool)
+        Skeleton image.
+    waypoints : list of (x, y)
+        Ordered waypoints along the curve (>= 2).
+    """
+    if len(waypoints) < 2:
+        return None
+
+    full_path: List[Tuple[int, int]] = []
+    for i in range(len(waypoints) - 1):
+        segment = trace_with_anchors(
+            skeleton, waypoints[i], waypoints[i + 1],
+            snap_radius=snap_radius,
+            curvature_penalty=curvature_penalty,
+            gap_bridge_max=gap_bridge_max,
+            gap_bridge_cost=gap_bridge_cost,
+            distance_transform=distance_transform,
+        )
+        if segment is None:
+            logger.warning("trace_with_waypoints: segment %d->%d failed", i, i + 1)
+            continue
+        # Avoid duplicating the junction point
+        start_idx = 1 if full_path and segment and segment[0] == full_path[-1] else 0
+        full_path.extend(segment[start_idx:])
+
+    return full_path if full_path else None
+
+
 def trace_with_anchors(
     skeleton: np.ndarray,
     start: Tuple[int, int],
@@ -2142,19 +2208,24 @@ def extract_bw_curves(
             logger.warning("DP tracker failed, falling back: %s", dp_err)
 
     # 2a) Anchor-guided tracing (if provided)
+    #     When anchors are given, trace ONLY through the anchors and
+    #     skip all automatic extraction — output exactly the user's curves.
     if anchors:
-        for start, end in anchors:
-            if len(result) >= target:
-                break
+        normalized = _normalize_anchors(anchors)
+        for curve_wps in normalized:
+            # Convert to local (skeleton) coords
+            local_wps = [(x - p_left, y - p_top) for x, y in curve_wps]
 
-            local_start = (start[0] - p_left, start[1] - p_top)
-            local_end = (end[0] - p_left, end[1] - p_top)
+            if len(local_wps) >= 2:
+                path = trace_with_waypoints(
+                    working_skeleton, local_wps,
+                    distance_transform=dt,
+                )
+            else:
+                path = None
 
-            path = trace_with_anchors(
-                working_skeleton, local_start, local_end,
-                distance_transform=dt,
-            )
             if not path:
+                logger.warning("extract_bw_curves: anchor trace failed for curve %d", len(result))
                 continue
 
             idx = len(result)
@@ -2163,6 +2234,29 @@ def extract_bw_curves(
 
             # Remove traced path from working skeleton
             _mask_pixels(working_skeleton, path, radius=2)
+
+        # Anchors provided → skip all further extraction.
+        # Smooth and return only the anchor-traced curves.
+        if smoothing_strength >= 0:
+            for idx in list(result.keys()):
+                pixels = result[idx]
+                if len(pixels) < 5:
+                    continue
+                first_pt = pixels[0]
+                last_pt = pixels[-1]
+                smoothed = smooth_curve(
+                    [(float(x), float(y)) for x, y in pixels],
+                    window_length=smoothing_strength,
+                )
+                smoothed_int = [(int(round(x)), int(round(y))) for x, y in smoothed]
+                if smoothed_int:
+                    smoothed_int[0] = first_pt
+                    smoothed_int[-1] = last_pt
+                result[idx] = smoothed_int
+
+        _save_bw_debug_overlay(image, plot_area, skeleton, binary, result, anchors)
+        logger.info("extract_bw_curves: anchor mode — extracted %d curve(s) only", len(result))
+        return result
 
     # 2b) Iterative skeleton component selection (proven primary method)
     remaining = target - len(result)
@@ -2382,18 +2476,23 @@ def _save_bw_debug_overlay(
             for i in range(len(pixels) - 1):
                 draw.line([pixels[i], pixels[i + 1]], fill=c, width=2)
 
-        # Anchor markers (start = green circle, end = red circle)
+        # Anchor markers
         if anchors:
-            for start, end in anchors:
+            normalized = _normalize_anchors(anchors)
+            for wps in normalized:
                 r = 6
-                draw.ellipse(
-                    [start[0] - r, start[1] - r, start[0] + r, start[1] + r],
-                    outline=(0, 255, 0, 255), width=2,
-                )
-                draw.ellipse(
-                    [end[0] - r, end[1] - r, end[0] + r, end[1] + r],
-                    outline=(255, 0, 0, 255), width=2,
-                )
+                for j, (ax, ay) in enumerate(wps):
+                    # First = green, last = red, middle = yellow
+                    if j == 0:
+                        c = (0, 255, 0, 255)
+                    elif j == len(wps) - 1:
+                        c = (255, 0, 0, 255)
+                    else:
+                        c = (255, 255, 0, 255)
+                    draw.ellipse(
+                        [ax - r, ay - r, ax + r, ay + r],
+                        outline=c, width=2,
+                    )
 
         out = Path(_DEBUG_DIR)
         out.mkdir(parents=True, exist_ok=True)

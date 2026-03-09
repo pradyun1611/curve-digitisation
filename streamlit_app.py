@@ -260,11 +260,11 @@ def main():
 
     # ── Click-to-place anchor canvas ──
     if uploaded_file is not None:
-        with st.expander("📍 Click-to-Place Anchors", expanded=False):
+        with st.expander("📍 Click-to-Place Anchors", expanded=True):
             st.caption(
-                "Add curves below, then click 📌 Start / 📌 End and click "
-                "on the image to place anchor points.  Anchors are sent to "
-                "the pipeline automatically when you press **Send**."
+                "Click **Add Curve**, then click many points along the curve. "
+                "The more points you place, the better the trace. "
+                "Anchors are sent to the pipeline when you press **Send**."
             )
             anchor_pairs = render_anchor_canvas(uploaded_file.getvalue())
             uploaded_file.seek(0)  # reset after reading
