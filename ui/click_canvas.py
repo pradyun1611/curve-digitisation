@@ -65,12 +65,24 @@ def render_anchor_canvas(image_bytes: bytes) -> Optional[List[List[Tuple[int, in
     # Picking indicator
     picking = st.session_state.picking
     if picking and picking.startswith("add_"):
-        curve_idx = int(picking.split("_")[1]) + 1
-        n_pts = len(st.session_state.click_curves[int(picking.split("_")[1])].get("waypoints", []))
-        st.info(
-            f"🎯 **Click on the image** to add points for Curve {curve_idx} "
-            f"({n_pts} placed). Click along the curve — more points = better trace!"
-        )
+        try:
+            curve_idx_num = int(picking.split("_")[1])
+            # Validate that this curve index still exists
+            if curve_idx_num >= len(st.session_state.click_curves):
+                # Curve was deleted, reset picking
+                st.session_state.picking = None
+                st.rerun()
+            else:
+                curve_idx = curve_idx_num + 1
+                n_pts = len(st.session_state.click_curves[curve_idx_num].get("waypoints", []))
+                st.info(
+                    f"🎯 **Click on the image** to add points for Curve {curve_idx} "
+                    f"({n_pts} placed). Click along the curve — more points = better trace!"
+                )
+        except (ValueError, IndexError):
+            # Invalid picking state, reset
+            st.session_state.picking = None
+            st.rerun()
 
     # Clickable image
     coords = streamlit_image_coordinates(
@@ -81,15 +93,21 @@ def render_anchor_canvas(image_bytes: bytes) -> Optional[List[List[Tuple[int, in
 
     # Handle click — add waypoint to the active curve
     if coords is not None and picking and picking.startswith("add_"):
-        click_x = int(coords["x"] * scale)
-        click_y = int(coords["y"] * scale)
-        if (click_x, click_y) != st.session_state.last_click_xy:
-            st.session_state.last_click_xy = (click_x, click_y)
+        try:
             curve_idx = int(picking.split("_")[1])
+            # Validate curve index still exists
             if curve_idx < len(st.session_state.click_curves):
-                st.session_state.click_curves[curve_idx].setdefault("waypoints", []).append(
-                    (click_x, click_y)
-                )
+                click_x = int(coords["x"] * scale)
+                click_y = int(coords["y"] * scale)
+                if (click_x, click_y) != st.session_state.last_click_xy:
+                    st.session_state.last_click_xy = (click_x, click_y)
+                    st.session_state.click_curves[curve_idx].setdefault("waypoints", []).append(
+                        (click_x, click_y)
+                    )
+                    st.rerun()
+        except (ValueError, IndexError):
+            # Invalid picking state, reset
+            st.session_state.picking = None
             st.rerun()
 
     # Curve cards
@@ -189,6 +207,15 @@ def _render_curve_cards() -> None:
         # Delete curve
         if cols[3].button("🗑️", key=f"del_c_{i}"):
             st.session_state.click_curves.pop(i)
-            if st.session_state.picking == f"add_{i}":
-                st.session_state.picking = None
+            
+            # Update picking state after deletion
+            if st.session_state.picking:
+                if st.session_state.picking.startswith("add_"):
+                    picking_idx = int(st.session_state.picking.split("_")[1])
+                    if picking_idx == i:
+                        # Deleting the curve we were picking, reset
+                        st.session_state.picking = None
+                    elif picking_idx > i:
+                        # Curves after the deleted one shifted down, adjust picking index
+                        st.session_state.picking = f"add_{picking_idx - 1}"
             st.rerun()
