@@ -280,6 +280,27 @@ def run_pipeline(
     )
 
     # ------------------------------------------------------------------
+    # 6a-bis. Per-curve reprojection quality (from extraction phase)
+    # ------------------------------------------------------------------
+    reprojection_summary: Dict[str, Any] = {}
+    for cname, cdata in curves_dict.items():
+        if not isinstance(cdata, dict):
+            continue
+        ri = cdata.get("reprojection")
+        if ri:
+            reprojection_summary[cname] = ri
+            logger.info(
+                "[%s] pipeline: reprojection '%s'  fitted_rmse=%.2fpx  "
+                "raw_rmse=%.2fpx  chosen=%s",
+                job_id, cname,
+                ri.get("fitted_rmse_px", -1),
+                ri.get("raw_rmse_px", -1),
+                ri.get("chosen", "?"),
+            )
+    if reprojection_summary:
+        debug_info["reprojection"] = reprojection_summary
+
+    # ------------------------------------------------------------------
     # 6b. Per-series regression quality (R² and Pearson R)
     # ------------------------------------------------------------------
     series_regression: Dict[str, Any] = {}

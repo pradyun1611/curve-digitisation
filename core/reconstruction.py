@@ -346,6 +346,9 @@ def _get_reconstructed_pixel_points(
     of the curve rather than re-drawing the original.
 
     Priority: fitted_points → pixel > axis_coords → pixel > pixel_coords.
+
+    CRITICAL: For grayscale extraction, also stores ``raw_overlay_pixels``
+    so the pipeline can compare raw vs fitted reprojection quality.
     """
     # Extract plot_area stored in the curve dict (if available)
     pa = cdata.get("plot_area")  # [left, top, right, bottom] or None
@@ -368,7 +371,24 @@ def _get_reconstructed_pixel_points(
             logger.debug("_get_reconstructed_pixel_points: axis_coords->pixel (%d pts)", len(pts))
             return pts
 
-    # 3) pixel_coords as last resort (only used when no mapping)
+    # 3) raw_pixel_points for grayscale curves (direct pixel data, most accurate)
+    raw_px = cdata.get("raw_pixel_points") or []
+    if raw_px:
+        # Sort by x, take centerline (median y per x)
+        from collections import defaultdict
+        by_x: Dict[int, List[int]] = defaultdict(list)
+        for p in raw_px:
+            by_x[int(p[0])].append(int(p[1]))
+        sorted_xs = sorted(by_x.keys())
+        pts = [(x, int(np.median(by_x[x]))) for x in sorted_xs]
+        # Subsample if too many
+        if len(pts) > 500:
+            step = max(1, len(pts) // 500)
+            pts = pts[::step]
+        logger.debug("_get_reconstructed_pixel_points: raw_pixel_points centerline (%d pts)", len(pts))
+        return pts
+
+    # 4) pixel_coords as last resort (only used when no mapping)
     pixel_coords = cdata.get("pixel_coords") or []
     if pixel_coords:
         pts = [(int(p[0]), int(p[1])) for p in pixel_coords]
@@ -390,6 +410,10 @@ def _data_to_pixel_simple(
     When *plot_area* ``[left, top, right, bottom]`` is supplied the mapping
     is relative to that sub-region of the full image, consistent with how
     ``CurveDigitizer.normalize_to_axis`` converts pixels → data.
+
+    CRITICAL: Uses fence-post arithmetic (p_right - p_left - 1) to match
+    the forward mapping in normalize_to_axis exactly.  Without this, the
+    round-trip pixel→data→pixel has a systematic offset.
     """
     xMin = float(axis_info.get("xMin", 0) or 0)
     xMax = float(axis_info.get("xMax", 100) or 100)
@@ -405,12 +429,13 @@ def _data_to_pixel_simple(
             int(plot_area[0]), int(plot_area[1]),
             int(plot_area[2]), int(plot_area[3]),
         )
-        p_width = p_right - p_left
-        p_height = p_bottom - p_top
     else:
         p_left, p_top = 0, 0
-        p_width = img_width
-        p_height = img_height
+        p_right, p_bottom = img_width, img_height
+
+    # Fence-post: must match normalize_to_axis which uses (p_right - p_left - 1)
+    p_width = max(p_right - p_left - 1, 1)
+    p_height = max(p_bottom - p_top - 1, 1)
 
     points: List[Tuple[int, int]] = []
     for p in data_coords:

@@ -206,10 +206,15 @@ def _poly_equation_string(coeffs: np.ndarray, deg: int) -> str:
 
 def _fit_poly_bic(
     x: np.ndarray, y: np.ndarray,
-    *, min_degree: int = 2, max_degree: int = 4, n_output: int = 300,
+    *, min_degree: int = 1, max_degree: int = 4, n_output: int = 300,
 ) -> Dict[str, Any]:
-    """Fit polynomial, choose degree by BIC.  Max degree capped to 4."""
+    """Fit polynomial, choose degree by BIC.  Max degree capped to 4.
+
+    Starts from degree 1 (linear) so straight/slanted lines stay straight.
+    Higher degrees are only chosen when they significantly improve BIC.
+    """
     max_degree = min(max_degree, 4)  # hard cap
+    min_degree = max(min_degree, 1)  # allow linear
     candidates_fit: Dict[int, Dict[str, Any]] = {}
     bic_by_deg: Dict[int, float] = {}
     best: Optional[Dict[str, Any]] = None
@@ -272,25 +277,30 @@ def _fit_poly_bic(
             bic_by_deg[deg] = bic
 
     if best is None:
-        # absolute fallback — degree 2
-        coeffs = np.polyfit(x, y, 2)
+        # absolute fallback — degree 2 (safe default for performance curves)
+        deg_fb = min(max_degree, max(min_degree, 2))
+        coeffs = np.polyfit(x, y, deg_fb)
         x_fit = np.linspace(float(x[0]), float(x[-1]), n_output)
         y_fit = np.polyval(coeffs, x_fit)
+        rss_fb = float(np.sum((y - np.polyval(coeffs, x)) ** 2))
+        ss_tot_fb = float(np.sum((y - np.mean(y)) ** 2))
+        r2_fb = 1.0 - rss_fb / ss_tot_fb if ss_tot_fb > 1e-12 else 1.0
         best = {
-            "degree": 2,
+            "degree": deg_fb,
             "coefficients": coeffs.tolist(),
-            "r_squared": 0.0,
+            "r_squared": float(r2_fb),
             "fitted_points": [
                 {"x": float(xv), "y": float(yv)}
                 for xv, yv in zip(x_fit, y_fit)
             ],
             "original_point_count": n,
-            "equation": "fallback poly(2)",
-            "fit_method": "poly_2",
-            "fit_rmse_on_centerline": 0.0,
+            "equation": f"fallback poly({deg_fb})",
+            "fit_method": f"poly_{deg_fb}",
+            "fit_rmse_on_centerline": float(math.sqrt(rss_fb / max(n, 1))),
         }
     # Degree preference to avoid needless wiggles:
-    # prefer lower degrees unless higher degree has clearly better BIC.
+    # STRONGLY prefer lower degrees unless higher degree improves BIC a lot.
+    # This prevents straight lines from being bent into arcs.
     if best is not None and isinstance(best.get("degree"), int):
         best_deg = int(best["degree"])
 
@@ -301,6 +311,18 @@ def _fit_poly_bic(
             if 2 in bic_by_deg and 2 in candidates_fit:
                 if bic_by_deg[3] - bic_by_deg[2] > -3.0:
                     best = candidates_fit[2]
+        # Prefer degree 1 (linear) over degree 2 only when the data
+        # is extremely well-explained by a straight line.  Be conservative:
+        # short segments of genuinely curved lines can have high linear R².
+        if isinstance(best.get("degree"), int) and int(best["degree"]) == 2:
+            if 1 in bic_by_deg and 1 in candidates_fit:
+                r2_lin = candidates_fit[1].get("r_squared", 0)
+                bic_diff = bic_by_deg[2] - bic_by_deg[1]
+                # Only prefer linear when R² is near-perfect AND BIC
+                # does not strongly favour quadratic
+                if r2_lin >= 0.999 and bic_diff > -3.0:
+                    best = candidates_fit[1]
+                    logger.debug("_fit_poly_bic: preferring linear (R²=%.4f)", r2_lin)
 
     return best
 
@@ -343,16 +365,24 @@ def _shape_sanity(
     max_d2_sign_changes: int = 0,
     min_d2_dominance: float = 0.85,
 ) -> Dict[str, Any]:
-    """Enforce unimodal arc shape.
+    """Enforce unimodal arc shape (only for degree >= 2).
 
     Rules (applied in order):
-    a) derivative should change sign at most *max_sign_changes* times
+    a) degree 1 (linear) always passes — straight lines are valid shapes;
+    b) derivative should change sign at most *max_sign_changes* times
        (one peak/valley is OK → efficiency hump);
-    b) if violated, reduce degree and refit until the constraint holds
-       or we reach degree 2 (which is always unimodal).
+    c) if violated, reduce degree and refit until the constraint holds
+       or we reach degree 2 (preferred minimum for performance curves).
     """
     fps = fit.get("fitted_points", [])
     if len(fps) < 10:
+        return fit
+
+    # Linear fits always pass shape sanity — they cannot invent curvature
+    current_deg = fit.get("degree", 4)
+    if not isinstance(current_deg, int):
+        current_deg = 4
+    if current_deg <= 1:
         return fit
 
     y_fit = np.array([p["y"] for p in fps])
@@ -362,16 +392,13 @@ def _shape_sanity(
     if sc <= max_sign_changes and d2_sc <= max_d2_sign_changes and d2_dom >= min_d2_dominance:
         return fit
 
-    current_deg = fit.get("degree", 4)
-    if not isinstance(current_deg, int):
-        current_deg = 4
-
     logger.info(
         "bw_fit shape_sanity: dy_sc=%d (max %d), d2_sc=%d (max %d), d2_dom=%.2f (min %.2f) at deg %d — downgrading",
         sc, max_sign_changes, d2_sc, max_d2_sign_changes, d2_dom, min_d2_dominance, current_deg,
     )
 
-    # Try progressively lower degrees
+    # Try progressively lower degrees down to 2 (preferred minimum
+    # for performance curves — degree 1 is too aggressive for most use cases)
     for try_deg in range(min(current_deg - 1, 3), 1, -1):
         refit = _fit_poly_bic(x, y, min_degree=try_deg, max_degree=try_deg,
                               n_output=n_output)
@@ -383,7 +410,7 @@ def _shape_sanity(
                 logger.info("bw_fit shape_sanity: deg %d passes", try_deg)
                 return refit
 
-    # Ultimate fallback: degree 2 (always unimodal)
+    # Fallback: degree 2 (quadratic — safe minimum for performance curves)
     logger.info("bw_fit shape_sanity: falling back to deg 2")
     return _fit_poly_bic(x, y, min_degree=2, max_degree=2, n_output=n_output)
 
@@ -452,8 +479,11 @@ def fit_bw_curve(
     # 3. Pre-smooth
     y_smooth = presmooth(y_clean)
 
-    # 4. Polynomial fit only (degree 2-4, BIC selection)
-    fit = _fit_poly_bic(x_clean, y_smooth, min_degree=2, max_degree=4,
+    # 4. Polynomial fit (degree 1-4, BIC selection)
+    # min_degree=1 allows BIC to detect truly straight lines, but the
+    # degree preference logic in _fit_poly_bic is conservative and only
+    # chooses deg 1 when R² >= 0.999.
+    fit = _fit_poly_bic(x_clean, y_smooth, min_degree=1, max_degree=4,
                         n_output=n_output)
 
     # 5. Shape sanity — enforce unimodal arc
@@ -465,14 +495,123 @@ def fit_bw_curve(
 
     cleaned_out = list(zip(x_clean.tolist(), y_smooth.tolist()))
 
+    # 6. Peak / best-value point (maximum y in data coordinates)
+    fps = fit.get("fitted_points", [])
+    if fps:
+        peak = max(fps, key=lambda p: p["y"])
+        fit["peak_point"] = {"x": round(peak["x"], 4), "y": round(peak["y"], 4)}
+    else:
+        fit["peak_point"] = None
+
     logger.info(
         "fit_bw_curve: method=%s  r2=%.4f  rmse=%.4f  bins=%d  "
-        "raw=%d  cleaned=%d",
+        "raw=%d  cleaned=%d  peak=%s",
         fit.get("fit_method", "?"),
         fit.get("r_squared", 0),
         fit.get("fit_rmse_on_centerline", 0),
         num_bins,
         len(axis_coords),
         len(cleaned_out),
+        fit.get("peak_point"),
     )
     return fit, cleaned_out
+
+
+# ====================================================================
+# 7. Reprojection comparison — raw polyline vs fitted curve
+# ====================================================================
+
+def compute_reprojection_rmse(
+    raw_pixel_points: List[Tuple[int, int]],
+    fitted_data_points: List[Dict[str, float]],
+    pixel_to_data_fn,
+    data_to_pixel_fn,
+) -> Tuple[float, float]:
+    """Compute reprojection RMSE for fitted vs raw points.
+
+    raw_pixel_points: original traced pixels [(px, py), ...]
+    fitted_data_points: [{"x": dx, "y": dy}, ...]
+    pixel_to_data_fn: callable(List[(px,py)]) -> List[(dx,dy)]
+    data_to_pixel_fn: callable(List[(dx,dy)]) -> List[(px,py)]
+
+    Returns (raw_reproj_rmse, fitted_reproj_rmse).
+    """
+    # Raw polyline round-trip error
+    raw_data = pixel_to_data_fn(raw_pixel_points)
+    raw_back = data_to_pixel_fn(raw_data)
+    raw_errors = []
+    for (px1, py1), (px2, py2) in zip(raw_pixel_points, raw_back):
+        raw_errors.append(math.sqrt((px1 - px2) ** 2 + (py1 - py2) ** 2))
+    raw_rmse = math.sqrt(sum(e * e for e in raw_errors) / max(len(raw_errors), 1))
+
+    # Fitted curve: convert data points back to pixel, then measure
+    # distance from each reprojected fitted point to nearest raw pixel
+    fitted_coords = [(p["x"], p["y"]) for p in fitted_data_points]
+    fitted_px = data_to_pixel_fn(fitted_coords)
+    if not raw_pixel_points or not fitted_px:
+        return (raw_rmse, float("inf"))
+
+    import numpy as np
+    raw_arr = np.array(raw_pixel_points, dtype=np.float64)
+    fitted_errors = []
+    for fpx, fpy in fitted_px:
+        dists = np.sqrt((raw_arr[:, 0] - fpx) ** 2 + (raw_arr[:, 1] - fpy) ** 2)
+        fitted_errors.append(float(np.min(dists)))
+    fitted_rmse = math.sqrt(sum(e * e for e in fitted_errors) / max(len(fitted_errors), 1))
+
+    return (raw_rmse, fitted_rmse)
+
+
+def build_raw_polyline_fit(
+    raw_pixel_points: List[Tuple[int, int]],
+    pixel_to_data_fn,
+    n_output: int = 300,
+) -> Dict[str, Any]:
+    """Build a fit_result dict from raw traced polyline (no smoothing).
+
+    This serves as a fallback when the polynomial fit has worse
+    reprojection error than the raw trace.
+    """
+    if len(raw_pixel_points) < 2:
+        return {}
+
+    data_pts = pixel_to_data_fn(raw_pixel_points)
+    # Sort by x and deduplicate
+    sorted_pts = sorted(data_pts, key=lambda p: p[0])
+
+    # Subsample to n_output points
+    if len(sorted_pts) > n_output:
+        step = max(1, len(sorted_pts) // n_output)
+        sorted_pts = sorted_pts[::step]
+
+    xs = [p[0] for p in sorted_pts]
+    ys = [p[1] for p in sorted_pts]
+
+    if not xs:
+        return {}
+
+    # Compute R² against linear fit to indicate linearity
+    import numpy as np
+    x_arr = np.array(xs)
+    y_arr = np.array(ys)
+    if len(x_arr) >= 2:
+        coeffs = np.polyfit(x_arr, y_arr, 1)
+        y_pred = np.polyval(coeffs, x_arr)
+        ss_res = float(np.sum((y_arr - y_pred) ** 2))
+        ss_tot = float(np.sum((y_arr - np.mean(y_arr)) ** 2))
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 1.0
+    else:
+        r2 = 1.0
+
+    return {
+        "degree": "raw_polyline",
+        "coefficients": None,
+        "r_squared": float(r2),
+        "fitted_points": [
+            {"x": float(x), "y": float(y)} for x, y in zip(xs, ys)
+        ],
+        "original_point_count": len(raw_pixel_points),
+        "equation": "raw traced polyline (no fit)",
+        "fit_method": "raw_polyline",
+        "fit_rmse_on_centerline": 0.0,
+    }

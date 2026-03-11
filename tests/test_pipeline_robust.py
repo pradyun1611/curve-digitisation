@@ -698,7 +698,7 @@ class TestConfig:
         cfg = DEFAULT_CONFIG
         assert cfg.grid_h_kernel_ratio > 0
         assert cfg.text_area_max_ratio > 0
-        assert cfg.close_kernel_size == (3, 7)
+        assert cfg.close_kernel_size == (3, 9)
         assert cfg.exclude_curve_mode == ""
         assert cfg.snap_radius > 0
 

@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 
 from core.router import classify_image_mode
-from core.bw_pipeline import extract_bw_curves, smooth_curve
+from core.bw_pipeline import extract_bw_curves, extract_surge_lines, smooth_curve
 from core.bw_fit import fit_bw_curve
 
 # ── Determinism: single-threaded BLAS/LAPACK ──────────────────────
@@ -1608,11 +1608,15 @@ class CurveDigitizer:
             ax_w = x_max - x_min if x_max != x_min else 1.0
             ax_h = y_max - y_min if y_max != y_min else 1.0
 
+            # Fence-post: match normalize_to_axis which uses (p_right - p_left - 1)
+            pa_px_w = max(pa_right - pa_left - 1, 1)
+            pa_px_h = max(pa_bot - pa_top - 1, 1)
+
             def ax2px_x(ax_x):
-                return pa_left + (ax_x - x_min) / ax_w * (pa_right - pa_left)
+                return pa_left + (ax_x - x_min) / ax_w * pa_px_w
 
             def ax2px_y(ax_y):
-                return pa_top + (y_max - ax_y) / ax_h * (pa_bot - pa_top)
+                return pa_top + (y_max - ax_y) / ax_h * pa_px_h
 
             dpi = 150
             fig2, ax2 = plt.subplots(figsize=(img_w / dpi, img_h / dpi), dpi=dpi)
@@ -1740,6 +1744,15 @@ class CurveDigitizer:
             # If user explicitly set target_curves in sidebar, prefer that
             if target_curves > 0:
                 num_curves = target_curves
+            # When anchors are provided, the user explicitly defined
+            # the curves — use anchor count as the definitive number.
+            _anchor_mode = False
+            if anchors:
+                _norm_anchors = [a for a in anchors
+                                 if isinstance(a, (list, tuple)) and len(a) >= 2]
+                if _norm_anchors:
+                    num_curves = len(_norm_anchors)
+                    _anchor_mode = True
             if num_curves > 0:
                 # Choose B/W extraction method
                 if use_skeleton_bw:
@@ -1791,31 +1804,25 @@ class CurveDigitizer:
                         reverse=True,          # descending: highest first
                     )
                     if len(known_vals) >= 2:
-                        step = known_vals[0] - known_vals[1]    # gap between adjacent
+                        step = abs(known_vals[0] - known_vals[1])
                         if step == 0:
                             step = 10
                     else:
                         step = 10
 
                     n_extra = n_clusters - len(known_vals)
-                    # Extrapolate *upward* from the highest known value
-                    top_val = known_vals[0] + step * n_extra
-                    full_vals = [top_val - i * step
-                                 for i in range(n_clusters)]
-
-                    # Re-build curve_features_sorted with correct count
+                    # Build labels for ALL clusters: existing labels +
+                    # generic numbered labels for extras.  Avoids
+                    # generating wrong values via extrapolation.
                     new_features = []
-                    for i, val in enumerate(full_vals):
-                        lbl = str(int(val)) if val == int(val) else str(val)
-                        if i < n_extra:
-                            # brand-new extrapolated entry (above LLM range)
-                            cf_copy = {'color': f'gray_{i}', 'label': lbl}
+                    for i in range(n_clusters):
+                        if i < len(curve_features_sorted):
+                            new_features.append(dict(curve_features_sorted[i]))
                         else:
-                            # reuse existing LLM feature, override label
-                            cf_copy = dict(
-                                curve_features_sorted[i - n_extra])
-                            cf_copy['label'] = lbl
-                        new_features.append(cf_copy)
+                            new_features.append({
+                                'color': f'gray_{i}',
+                                'label': f'Curve {i + 1}',
+                            })
                     curve_features_sorted = new_features
 
                 # ── Debug: save cluster visualisation ──
@@ -1881,11 +1888,16 @@ class CurveDigitizer:
                     # Replaces the generic clean→sigma-clip→polyfit(2) pipeline
                     # with binned-median centerline extraction, Hampel + sigma-clip
                     # outlier removal, Savitzky-Golay pre-smooth, and BIC-selected
-                    # polynomial degree 2-4 with shape sanity checks.
+                    # polynomial degree 1-4 with shape sanity checks.
                     fit_result, cleaned_coords = fit_bw_curve(axis_coords)
+
+                    reproj_info = {}
 
                     # Quality metrics (same as colour path)
                     metrics = self.calculate_curve_metrics(cleaned_coords, fit_result)
+
+                    # Peak / best-value point
+                    peak_point = fit_result.get('peak_point')
 
                     results['curves'][color_key] = {
                         'label': label, 'color': color_key,
@@ -1896,8 +1908,39 @@ class CurveDigitizer:
                         'normalized_point_count': len(axis_coords),
                         'cleaned_point_count': len(cleaned_coords),
                         'fit_result': fit_result,
-                        'metrics': metrics
+                        'metrics': metrics,
+                        'peak_point': peak_point,
+                        'reprojection': reproj_info,
                     }
+
+                # ── Surge / dashed-line extraction ──
+                # Skip in anchor mode: the user explicitly defined
+                # which curves to extract — don't add spurious fragments.
+                if not _anchor_mode:
+                    try:
+                        surge_curves = extract_surge_lines(
+                            image, plot_area, gray_clusters,
+                        )
+                        for s_idx, s_pixels in surge_curves.items():
+                            s_key = f'surge_{s_idx}'
+                            s_axis = self.normalize_to_axis(s_pixels, width, height, plot_area)
+                            s_fit, s_cleaned = fit_bw_curve(s_axis)
+                            s_peak = s_fit.get('peak_point')
+                            results['curves'][s_key] = {
+                                'label': f'Surge Line {s_idx + 1}',
+                                'color': s_key,
+                                'extraction_mode': 'grayscale',
+                                'is_surge_line': True,
+                                'raw_pixel_points': s_pixels,
+                                'plot_area': list(plot_area),
+                                'original_point_count': len(s_pixels),
+                                'normalized_point_count': len(s_axis),
+                                'cleaned_point_count': len(s_cleaned),
+                                'fit_result': s_fit,
+                                'peak_point': s_peak,
+                            }
+                    except Exception as _surge_err:
+                        logger.warning('Surge line extraction failed: %s', _surge_err)
 
                 # ── Debug: save fitted-curves overlay ──
                 if _DEBUG_DIR:
@@ -2021,6 +2064,13 @@ class CurveDigitizer:
                 # Calculate quality metrics
                 metrics = self.calculate_curve_metrics(cleaned_coords, fit_result)
                 
+                # Peak / best-value point for colour curves
+                color_peak = None
+                color_fps = fit_result.get('fitted_points', [])
+                if color_fps:
+                    cpk = max(color_fps, key=lambda p: p['y'])
+                    color_peak = {'x': round(cpk['x'], 4), 'y': round(cpk['y'], 4)}
+
                 results['curves'][color] = {
                     'label': label,
                     'color': color,
@@ -2029,7 +2079,8 @@ class CurveDigitizer:
                     'normalized_point_count': len(axis_coords),
                     'cleaned_point_count': len(cleaned_coords),
                     'fit_result': fit_result,
-                    'metrics': metrics
+                    'metrics': metrics,
+                    'peak_point': color_peak,
                 }
         
         # Compute aggregate (graph-level) metrics across all curves

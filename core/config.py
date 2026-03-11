@@ -26,10 +26,13 @@ class BWPipelineConfig:
     roi_padding_frac: float = 0.02
 
     # ── Gridline removal (morphological) ──
-    grid_h_kernel_ratio: float = 0.20      # horizontal kernel = img_w * ratio
-    grid_v_kernel_ratio: float = 0.20      # vertical kernel = img_h * ratio
-    grid_fill_threshold: float = 0.80      # fallback: row/col fill > threshold
+    grid_h_kernel_ratio: float = 0.18      # horizontal kernel = img_w * ratio
+    grid_v_kernel_ratio: float = 0.18      # vertical kernel = img_h * ratio
+    grid_fill_threshold: float = 0.75      # fallback: row/col fill > threshold
     grid_protect_curves: bool = True       # protect curve crossings
+    grid_many_lines_threshold: int = 6     # > N detected lines → lower span ratio
+    grid_span_ratio_strict: float = 0.80   # few lines: keep only near-full-span
+    grid_span_ratio_loose: float = 0.40    # many lines: also remove partial lines
 
     # ── Text removal (CC-based) ──
     text_area_max_ratio: float = 0.012     # max component area / plot area
@@ -45,7 +48,9 @@ class BWPipelineConfig:
 
     # ── Morphological closing (gap bridging) ──
     close_kernel_h: int = 3
-    close_kernel_w: int = 7
+    close_kernel_w: int = 9
+    close_wide_kernel_w: int = 17          # second pass for heavily cleaned images
+    close_wide_fg_threshold: float = 0.08  # trigger wide close when fg < this
 
     # ── Curve extraction ──
     min_curve_pixels: int = 15
@@ -61,10 +66,19 @@ class BWPipelineConfig:
     smoothing_polyorder: int = 3
 
     # ── A* tracing ──
-    snap_radius: int = 20
+    snap_radius: int = 50
     curvature_penalty: float = 2.0
-    gap_bridge_max: int = 10
-    gap_bridge_cost: float = 5.0
+    gap_bridge_max: int = 30
+    gap_bridge_cost: float = 4.0
+    astar_max_iters: int = 500_000          # hard cap on A* iterations
+    anchor_min_success_rate: float = 0.40   # fall back if fewer anchors succeed
+
+    # ── Surge / dashed-line detection ──
+    surge_dashed_threshold: float = 0.18
+    surge_min_span_ratio: float = 0.08
+    surge_gap_periodic_cv: float = 1.2      # coefficient-of-variation cutoff
+    surge_min_thickness: float = 2.5
+    surge_min_gaps: int = 2
 
     # ── Endpoint extension ──
     extend_search_radius: int = 20

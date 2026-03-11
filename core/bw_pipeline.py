@@ -248,6 +248,16 @@ def preprocess_bw(
     ck = np.ones(close_kernel_size, dtype=bool)
     binary = binary_closing(binary, structure=ck, iterations=1)
 
+    # 4b. For heavily-gridded scans, do a second, wider close to bridge
+    #     the bigger gaps left by aggressive grid removal.
+    fg_after_grid = float(binary.sum()) / max(binary.size, 1)
+    wide_w = cfg.close_wide_kernel_w if cfg else 17
+    wide_thresh = cfg.close_wide_fg_threshold if cfg else 0.08
+    if fg_after_grid < wide_thresh:
+        wide_ck = np.ones((3, wide_w), dtype=bool)
+        binary = binary_closing(binary, structure=wide_ck, iterations=1)
+        logger.debug("preprocess_bw: wide close applied (fg_ratio=%.3f)", fg_after_grid)
+
     # 5. Remove isolated single-pixel noise
     padded = np.pad(binary.astype(np.uint8), 1, mode='constant')
     neighbor_count = np.zeros((rh, rw), dtype=np.uint8)
@@ -512,7 +522,24 @@ def _remove_gridlines_morph(
 
     # Filter: only keep detections that span ≥ 85 % of full width/height.
     # This prevents shallow curves from being misidentified as grid lines.
-    SPAN_RATIO = 0.85
+    # Adaptive span ratio: use a lower threshold for images with many
+    # detected lines (typical of heavily-gridded scanned charts).
+    h_line_rows = set()
+    if h_lines.any():
+        for r in range(img_h):
+            if h_lines[r, :].any():
+                h_line_rows.add(r)
+    v_line_cols = set()
+    if v_lines.any():
+        for c in range(img_w):
+            if v_lines[:, c].any():
+                v_line_cols.add(c)
+    n_detected = len(h_line_rows) + len(v_line_cols)
+    many_lines = n_detected > 6
+    SPAN_RATIO = 0.40 if many_lines else 0.80
+    logger.debug("_remove_gridlines_morph: detected %d H-lines, %d V-lines → "
+                 "SPAN_RATIO=%.2f", len(h_line_rows), len(v_line_cols), SPAN_RATIO)
+
     if h_lines.any():
         for r in range(img_h):
             row_d = h_lines[r, :]
@@ -1156,9 +1183,8 @@ def select_best_curves(
 
     Selection criteria:
       - Reject text-like components (text_score > text_threshold)
-      - Reject dashed components (dashed_score > dashed_threshold)
-      - Reject near-vertical components (likely reference lines)
-      - Score: x_span * density * (1 - dashed_score) * (1 - text_score)
+      - Soft-penalize dashed components (don't outright reject)
+      - Score: x_span * density * (1 - text_score)
       - If auto_detect=True, return max(num_curves, auto-detected good count)
     """
     candidates = []
@@ -1172,26 +1198,30 @@ def select_best_curves(
             )
             continue
 
-        # Reject dashed/dotted components
+        # Soft-penalize dashed components rather than hard-rejecting them.
+        # This lets dashed curves survive when needed (e.g., only a few curves).
+        dashed_penalty = 1.0
         if ignore_dashed and comp["dashed_score"] > dashed_threshold:
+            dashed_penalty = max(0.1, 1.0 - comp["dashed_score"])
             logger.debug(
-                "Rejecting dashed component: dashed_score=%.2f, area=%d",
+                "Penalizing dashed component: dashed_score=%.2f, area=%d",
                 comp["dashed_score"], comp["area"],
             )
-            continue
 
         # Score: prefer large span * density, penalize text/dashed
         density = comp["area"] / max(comp["x_span"], 1)
         score = (
             comp["x_span"]
             * density
-            * (1.0 - comp["dashed_score"])
+            * dashed_penalty
             * (1.0 - text_score)
         )
 
-        # Penalize very steep components (likely vertical reference lines)
-        if comp["y_span"] > comp["x_span"] * 1.5:
-            score *= 0.1
+        # Mild penalty for very steep (likely vertical reference lines)
+        if comp["y_span"] > comp["x_span"] * 2.0:
+            score *= 0.3
+        elif comp["y_span"] > comp["x_span"] * 1.5:
+            score *= 0.5
 
         candidates.append({**comp, "selection_score": score})
 
@@ -1248,10 +1278,10 @@ def trace_with_waypoints(
     skeleton: np.ndarray,
     waypoints: List[Tuple[int, int]],
     *,
-    snap_radius: int = 20,
+    snap_radius: int = 50,
     curvature_penalty: float = 2.0,
-    gap_bridge_max: int = 10,
-    gap_bridge_cost: float = 5.0,
+    gap_bridge_max: int = 30,
+    gap_bridge_cost: float = 4.0,
     distance_transform: Optional[np.ndarray] = None,
 ) -> Optional[List[Tuple[int, int]]]:
     """Trace a curve through multiple waypoints using A* between consecutive pairs.
@@ -1267,7 +1297,9 @@ def trace_with_waypoints(
         return None
 
     full_path: List[Tuple[int, int]] = []
-    for i in range(len(waypoints) - 1):
+    segments_ok = 0
+    segments_total = len(waypoints) - 1
+    for i in range(segments_total):
         segment = trace_with_anchors(
             skeleton, waypoints[i], waypoints[i + 1],
             snap_radius=snap_radius,
@@ -1277,11 +1309,36 @@ def trace_with_waypoints(
             distance_transform=distance_transform,
         )
         if segment is None:
-            logger.warning("trace_with_waypoints: segment %d->%d failed", i, i + 1)
+            # A* failed for this segment.  The user clicked both
+            # waypoints ON the curve, so add them as raw fallback
+            # points.  Polynomial fitting downstream will smooth
+            # the gaps between them.
+            wp_start = waypoints[i]
+            wp_end = waypoints[i + 1]
+            if not full_path or full_path[-1] != wp_start:
+                full_path.append(wp_start)
+            full_path.append(wp_end)
+            logger.debug(
+                "trace_with_waypoints: segment %d->%d A* failed, "
+                "using raw waypoints as fallback", i, i + 1,
+            )
             continue
+        segments_ok += 1
         # Avoid duplicating the junction point
         start_idx = 1 if full_path and segment and segment[0] == full_path[-1] else 0
         full_path.extend(segment[start_idx:])
+
+    if segments_ok == 0:
+        logger.warning(
+            "trace_with_waypoints: all %d A* segments failed — "
+            "using %d raw waypoints as trace",
+            segments_total, len(full_path),
+        )
+    elif segments_ok < segments_total:
+        logger.info("trace_with_waypoints: %d/%d segments succeeded "
+                    "(%d waypoint fallbacks)",
+                    segments_ok, segments_total,
+                    segments_total - segments_ok)
 
     return full_path if full_path else None
 
@@ -1291,10 +1348,10 @@ def trace_with_anchors(
     start: Tuple[int, int],
     end: Tuple[int, int],
     *,
-    snap_radius: int = 20,
+    snap_radius: int = 50,
     curvature_penalty: float = 2.0,
-    gap_bridge_max: int = 10,
-    gap_bridge_cost: float = 5.0,
+    gap_bridge_max: int = 30,
+    gap_bridge_cost: float = 4.0,
     tangent_window: int = 5,
     distance_transform: Optional[np.ndarray] = None,
 ) -> Optional[List[Tuple[int, int]]]:
@@ -1359,7 +1416,7 @@ def trace_with_anchors(
     dirs = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
 
     found = False
-    max_iters = w * h * 2
+    max_iters = min(w * h * 2, 500_000)   # hard cap to prevent hangs
 
     for _ in range(max_iters):
         if not open_set:
@@ -1458,7 +1515,11 @@ def _snap_to_skeleton(
     point: Tuple[int, int],
     radius: int,
 ) -> Optional[Tuple[int, int]]:
-    """Snap a point to the nearest skeleton pixel within radius."""
+    """Snap a point to the nearest skeleton pixel within radius.
+
+    Uses EDT for O(1) distance lookup when the skeleton is dense,
+    falling back to window search for sparse skeletons.
+    """
     h, w = skeleton.shape
     px, py = point
 
@@ -1466,24 +1527,24 @@ def _snap_to_skeleton(
     if 0 <= py < h and 0 <= px < w and skeleton[py, px]:
         return (px, py)
 
-    best = None
-    best_dist = float("inf")
+    # Fast path: extract local window, find closest skeleton pixel
+    r = min(radius, max(h, w))
+    y0 = max(0, py - r)
+    y1 = min(h, py + r + 1)
+    x0 = max(0, px - r)
+    x1 = min(w, px + r + 1)
+    patch = skeleton[y0:y1, x0:x1]
+    skel_ys, skel_xs = np.where(patch)
+    if len(skel_ys) == 0:
+        return None
 
-    for r in range(1, radius + 1):
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                if abs(dy) != r and abs(dx) != r:
-                    continue  # Only check border of square
-                ny, nx = py + dy, px + dx
-                if 0 <= ny < h and 0 <= nx < w and skeleton[ny, nx]:
-                    dist = math.sqrt(dx * dx + dy * dy)
-                    if dist < best_dist:
-                        best_dist = dist
-                        best = (nx, ny)
-        if best is not None:
-            return best
-
-    return None
+    # Compute distances in patch coordinates
+    dists = np.sqrt((skel_xs.astype(float) - (px - x0)) ** 2 +
+                    (skel_ys.astype(float) - (py - y0)) ** 2)
+    best_idx = int(np.argmin(dists))
+    if dists[best_idx] > radius:
+        return None
+    return (int(skel_xs[best_idx]) + x0, int(skel_ys[best_idx]) + y0)
 
 
 def _distance_to_skeleton(
@@ -1491,17 +1552,22 @@ def _distance_to_skeleton(
     x: int, y: int,
     max_dist: int,
 ) -> int:
-    """Find distance from (x,y) to nearest skeleton pixel, up to max_dist."""
+    """Find distance from (x,y) to nearest skeleton pixel, up to max_dist.
+
+    Uses a local-window numpy search instead of per-pixel loops.
+    """
     h, w = skeleton.shape
-    for r in range(1, max_dist + 1):
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                if abs(dy) != r and abs(dx) != r:
-                    continue
-                ny, nx = y + dy, x + dx
-                if 0 <= ny < h and 0 <= nx < w and skeleton[ny, nx]:
-                    return r
-    return max_dist + 1
+    r = min(max_dist, max(h, w))
+    y0, y1 = max(0, y - r), min(h, y + r + 1)
+    x0, x1 = max(0, x - r), min(w, x + r + 1)
+    patch = skeleton[y0:y1, x0:x1]
+    sy, sx = np.where(patch)
+    if len(sy) == 0:
+        return max_dist + 1
+    dists = np.sqrt((sx.astype(float) - (x - x0)) ** 2 +
+                    (sy.astype(float) - (y - y0)) ** 2)
+    d = float(np.min(dists))
+    return int(d) if d <= max_dist else max_dist + 1
 
 
 # ====================================================================
@@ -1683,7 +1749,11 @@ def smooth_curve(
     polyorder: int = 3,
     resample_step: float = 0.0,
 ) -> List[Tuple[float, float]]:
-    """Apply Savitzky-Golay smoothing to a polyline.
+    """Apply adaptive smoothing to a polyline.
+
+    For nearly-straight data (high R² against linear fit), uses very
+    light or no smoothing to preserve geometry.  For curved data, uses
+    Savitzky-Golay with auto-sized window.
 
     Parameters
     ----------
@@ -1691,7 +1761,8 @@ def smooth_curve(
         Ordered polyline coordinates (axis or pixel space).
     window_length : int
         SG filter window (must be odd, > polyorder).
-        0 = auto-select based on point count.
+        0 = auto-select based on point count and curvature.
+        -1 = no smoothing at all.
     polyorder : int
         Polynomial order for SG filter.
     resample_step : float
@@ -1715,6 +1786,30 @@ def smooth_curve(
 
     if len(xs) < 5:
         return [(float(x), float(y)) for x, y in zip(xs, ys)]
+
+    # --- Adaptive smoothing: check how linear the data already is ---
+    # If R² of linear fit is extremely high, reduce smoothing to avoid
+    # introducing artificial curvature onto truly straight data.
+    if window_length >= 0:  # not explicitly disabled
+        try:
+            lin_coeffs = np.polyfit(xs, ys, 1)
+            lin_pred = np.polyval(lin_coeffs, xs)
+            ss_res = float(np.sum((ys - lin_pred) ** 2))
+            ss_tot = float(np.sum((ys - np.mean(ys)) ** 2))
+            r2_linear = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 1.0
+        except Exception:
+            r2_linear = 0.0
+
+        # Only skip smoothing for nearly-horizontal data that is
+        # already very clean (R² > 0.9999).  Diagonal lines with
+        # small noise still benefit from smoothing.
+        if r2_linear > 0.9999 and ss_tot < 1e-6:
+            return [(float(x), float(y)) for x, y in zip(xs, ys)]
+
+        # If data is extremely linear (R² > 0.999), use light smoothing
+        if r2_linear > 0.999:
+            window_length = max(5, min(7, len(xs)))
+            polyorder = 1  # linear SG = moving average in x
 
     # Optional resampling
     if resample_step > 0:
@@ -2172,46 +2267,58 @@ def extract_bw_curves(
                         mask_img[ny, nx] = False
 
     # ── Step 2-pre: DP-based ordered multi-curve extraction ──
-    #    Extracts non-crossing curves via sequential DP with exclusion bands.
-    #    Skip when anchors are provided – anchor-guided tracing is more precise.
-    if not anchors:
-        try:
-            from core.dp_tracker import extract_curves_dp
+    #    Always run DP to have fallback curves; anchor tracing can override.
+    dp_curves_available: Dict[int, List[Tuple[int, int]]] = {}
+    try:
+        from core.dp_tracker import extract_curves_dp
 
-            dp_curves, dp_debug = extract_curves_dp(
-                binary, skeleton, target,
-                max_jump=0,          # auto
-                jump_weight=0.3,
-                curvature_weight=0.1,
-                min_span_ratio=0.25,
+        dp_curves, dp_debug = extract_curves_dp(
+            binary, skeleton, target,
+            max_jump=0,          # auto
+            jump_weight=0.3,
+            curvature_weight=0.1,
+            min_span_ratio=0.15,  # relaxed: accept shorter curves
+        )
+        if dp_curves:
+            dp_curves_available = {
+                idx: [(x + p_left, y + p_top) for x, y in pixels]
+                for idx, pixels in dp_curves.items()
+            }
+            logger.info(
+                "extract_bw_curves: DP tracker produced %d curves",
+                len(dp_curves),
             )
-            if dp_curves:
-                for idx, pixels in dp_curves.items():
-                    result[idx] = [(x + p_left, y + p_top)
-                                   for x, y in pixels]
-                    _mask_pixels(working_skeleton, pixels, radius=2)
-                logger.info(
-                    "extract_bw_curves: DP tracker produced %d curves",
-                    len(dp_curves),
-                )
-                # Save debug overlay when requested
-                if cfg.debug_bw and cfg.debug_bw_dir:
-                    try:
-                        from core.reconstruction import render_dp_debug
-                        render_dp_debug(
-                            np.array(image), plot_area, skeleton,
-                            dp_curves, dp_debug, cfg.debug_bw_dir,
-                        )
-                    except Exception as dbg_err:
-                        logger.debug("DP debug overlay failed: %s", dbg_err)
-        except Exception as dp_err:
-            logger.warning("DP tracker failed, falling back: %s", dp_err)
+            # Save debug overlay when requested
+            if cfg.debug_bw and cfg.debug_bw_dir:
+                try:
+                    from core.reconstruction import render_dp_debug
+                    render_dp_debug(
+                        np.array(image), plot_area, skeleton,
+                        dp_curves, dp_debug, cfg.debug_bw_dir,
+                    )
+                except Exception as dbg_err:
+                    logger.debug("DP debug overlay failed: %s", dbg_err)
+    except Exception as dp_err:
+        logger.warning("DP tracker failed: %s", dp_err)
+
+    # Use DP results as initial set (will be replaced if anchors succeed)
+    if not anchors and dp_curves_available:
+        for idx, pixels in dp_curves_available.items():
+            result[idx] = pixels
+            local_pxs = [(x - p_left, y - p_top) for x, y in pixels]
+            _mask_pixels(working_skeleton, local_pxs, radius=2)
 
     # 2a) Anchor-guided tracing (if provided)
-    #     When anchors are given, trace ONLY through the anchors and
-    #     skip all automatic extraction — output exactly the user's curves.
+    #     When anchors are given, attempt tracing through the anchors.
+    #     If most anchors fail, fall through to automatic extraction.
+    anchor_attempted = False
+    anchor_success_rate = 0.0
     if anchors:
+        anchor_attempted = True
         normalized = _normalize_anchors(anchors)
+        anchor_total = len(normalized)
+        anchor_ok = 0
+        anchor_results: Dict[int, List[Tuple[int, int]]] = {}
         for curve_wps in normalized:
             # Convert to local (skeleton) coords
             local_wps = [(x - p_left, y - p_top) for x, y in curve_wps]
@@ -2219,51 +2326,93 @@ def extract_bw_curves(
             if len(local_wps) >= 2:
                 path = trace_with_waypoints(
                     working_skeleton, local_wps,
+                    snap_radius=cfg.snap_radius,
+                    gap_bridge_max=cfg.gap_bridge_max,
+                    gap_bridge_cost=cfg.gap_bridge_cost,
+                    curvature_penalty=cfg.curvature_penalty,
                     distance_transform=dt,
                 )
             else:
                 path = None
 
-            if not path:
-                logger.warning("extract_bw_curves: anchor trace failed for curve %d", len(result))
+            if not path or len(path) < 2:
+                logger.warning("extract_bw_curves: anchor trace failed for curve %d", len(anchor_results))
                 continue
 
-            idx = len(result)
+            # Log span coverage for diagnostics but do NOT reject.
+            # The user explicitly traced this curve — trust their
+            # waypoints even when A* could only fill in portions.
+            wp_x_span = abs(local_wps[-1][0] - local_wps[0][0])
+            path_xs = [p[0] for p in path]
+            path_x_span = max(path_xs) - min(path_xs) if path_xs else 0
+            if wp_x_span > 0:
+                coverage = path_x_span / wp_x_span * 100
+                logger.info(
+                    "extract_bw_curves: anchor trace covers %.0f%% "
+                    "of waypoint span (%d/%d px) for curve %d",
+                    coverage, path_x_span, wp_x_span, len(anchor_results),
+                )
+
+            idx = len(anchor_results)
             full_path = [(x + p_left, y + p_top) for x, y in path]
-            result[idx] = full_path
+            anchor_results[idx] = full_path
+            anchor_ok += 1
 
             # Remove traced path from working skeleton
             _mask_pixels(working_skeleton, path, radius=2)
 
-        # Anchors provided → skip all further extraction.
-        # Smooth and return only the anchor-traced curves.
-        if smoothing_strength >= 0:
-            for idx in list(result.keys()):
-                pixels = result[idx]
-                if len(pixels) < 5:
-                    continue
-                first_pt = pixels[0]
-                last_pt = pixels[-1]
-                smoothed = smooth_curve(
-                    [(float(x), float(y)) for x, y in pixels],
-                    window_length=smoothing_strength,
-                )
-                smoothed_int = [(int(round(x)), int(round(y))) for x, y in smoothed]
-                if smoothed_int:
-                    smoothed_int[0] = first_pt
-                    smoothed_int[-1] = last_pt
-                result[idx] = smoothed_int
+        anchor_success_rate = anchor_ok / max(anchor_total, 1)
 
-        _save_bw_debug_overlay(image, plot_area, skeleton, binary, result, anchors)
-        logger.info("extract_bw_curves: anchor mode — extracted %d curve(s) only", len(result))
-        return result
+        # Only use anchor results if enough curves traced successfully
+        min_rate = cfg.anchor_min_success_rate if cfg else 0.40
+        if anchor_success_rate >= min_rate and anchor_ok >= 1:
+            result = anchor_results
+            # Smooth and return
+            if smoothing_strength >= 0:
+                for idx in list(result.keys()):
+                    pixels = result[idx]
+                    if len(pixels) < 5:
+                        continue
+                    first_pt = pixels[0]
+                    last_pt = pixels[-1]
+                    smoothed = smooth_curve(
+                        [(float(x), float(y)) for x, y in pixels],
+                        window_length=smoothing_strength,
+                    )
+                    smoothed_int = [(int(round(x)), int(round(y))) for x, y in smoothed]
+                    if smoothed_int:
+                        smoothed_int[0] = first_pt
+                        smoothed_int[-1] = last_pt
+                    result[idx] = smoothed_int
+
+            _save_bw_debug_overlay(image, plot_area, skeleton, binary, result, anchors)
+            logger.info("extract_bw_curves: anchor mode — extracted %d curve(s) only", len(result))
+            return result
+        else:
+            logger.warning(
+                "extract_bw_curves: anchor tracing poor (%.0f%% success, %d/%d). "
+                "Falling back to automatic extraction.",
+                anchor_success_rate * 100, anchor_ok, anchor_total,
+            )
+            # Reset working skeleton and seed with DP results as fallback
+            working_skeleton = skeleton.copy()
+            if dp_curves_available:
+                for idx, pixels in dp_curves_available.items():
+                    result[idx] = pixels
+                    local_pxs = [(x - p_left, y - p_top) for x, y in pixels]
+                    _mask_pixels(working_skeleton, local_pxs, radius=2)
+                logger.info("extract_bw_curves: seeded %d DP curves as fallback",
+                            len(dp_curves_available))
 
     # 2b) Iterative skeleton component selection (proven primary method)
+    #     Extract up to max(target, available) curves — let downstream
+    #     label-assignment and geometry filter decide which to keep.
     remaining = target - len(result)
     if remaining > 0:
-        max_rounds = remaining + 3
+        max_to_extract = max(target, 3)  # always try at least 3
+        max_rounds = max_to_extract + 5
         for _round in range(max_rounds):
-            if len(result) >= target:
+            if len(result) >= max_to_extract:
                 break
 
             components = extract_skeleton_components(working_skeleton)
@@ -2345,21 +2494,22 @@ def extract_bw_curves(
                 "score": score,
             }
 
-        # Hard reject obvious non-curves
+        # Soft-reject unlikely non-curves (relaxed thresholds)
         all_items: List[Tuple[int, List[Tuple[int, int]], Dict[str, float]]] = []
         filtered_items: List[Tuple[int, List[Tuple[int, int]], Dict[str, float]]] = []
         rejected_items: List[Tuple[int, List[Tuple[int, int]], Dict[str, float]]] = []
         for idx, pixels in result.items():
             st = _track_stats(pixels)
             all_items.append((idx, pixels, st))
-            if st["x_span"] < rw * 0.20:
+            # Only reject *very* short fragments
+            if st["x_span"] < rw * 0.10:
                 rejected_items.append((idx, pixels, st))
                 continue
-            if st["coverage"] < 0.18:
+            if st["coverage"] < 0.08:
                 rejected_items.append((idx, pixels, st))
                 continue
-            # Very steep + not wide enough -> likely reference/flow line
-            if st["slope_ratio"] > 1.2 and st["x_span"] < rw * 0.70:
+            # Reject near-vertical only when extremely steep AND very short
+            if st["slope_ratio"] > 2.5 and st["x_span"] < rw * 0.30:
                 rejected_items.append((idx, pixels, st))
                 continue
             filtered_items.append((idx, pixels, st))
@@ -2427,6 +2577,160 @@ def extract_bw_curves(
 
     logger.info("extract_bw_curves: extracted %d curves", len(result))
     return result
+
+
+# ====================================================================
+# 10. Surge / dashed-line extraction
+# ====================================================================
+
+def extract_surge_lines(
+    image: Image.Image,
+    plot_area: Tuple[int, int, int, int],
+    main_curves: Optional[Dict[int, List[Tuple[int, int]]]] = None,
+    *,
+    dashed_threshold: float = 0.20,
+    min_span_ratio: float = 0.10,
+    config: Optional[BWPipelineConfig] = None,
+) -> Dict[int, List[Tuple[int, int]]]:
+    """Extract dashed / dotted / dash-dot lines (e.g. surge lines).
+
+    Uses two complementary strategies:
+      A) Skeleton-based: find components with high ``score_dashed()``.
+      B) Binary-based: find thick connected components in the cleaned
+         binary (before skeletonization) that have periodic gaps when
+         projected along their dominant axis.  This catches thick
+         dash-dot lines that are bridged into one blob by morphological
+         closing but still show periodicity in the raw binary.
+
+    Already-extracted main curves are masked out so they aren't
+    returned as surge lines.
+
+    Returns
+    -------
+    Dict[int, List[(x, y)]]
+        Index → pixel coordinates in full-image space.
+    """
+    cfg = config or DEFAULT_CONFIG
+    p_left, p_top, p_right, p_bottom = plot_area
+
+    # Light preprocessing: binarise + grid/text/tick removal, but
+    # skip the morphological closing so dash gaps are preserved.
+    img_array = np.array(image.convert("RGB"))
+    region = img_array[p_top:p_bottom, p_left:p_right]
+    if region.ndim == 3:
+        gray = np.mean(region[:, :, :3].astype(np.float32), axis=2).astype(np.uint8)
+    else:
+        gray = region.astype(np.uint8)
+    rh, rw = gray.shape
+
+    if cfg.clahe_clip_limit > 0:
+        gray = _apply_clahe(gray, cfg.clahe_clip_limit, cfg.clahe_tile_grid_size)
+    gray = np.array(Image.fromarray(gray).filter(ImageFilter.MedianFilter(size=3)))
+
+    threshold = _otsu_threshold(gray)
+    raw_binary = gray <= min(threshold + 10, 200)
+
+    if cfg.adaptive_thresh:
+        fg_ratio = float(raw_binary.sum()) / max(raw_binary.size, 1)
+        if fg_ratio > 0.50 or fg_ratio < 0.01:
+            raw_binary = _adaptive_threshold(gray, cfg.adaptive_block_size,
+                                             cfg.adaptive_C)
+
+    # Remove grid and text (but NOT morphological closing — keep gaps)
+    raw_binary = _remove_gridlines_morph(raw_binary, rh, rw)
+    raw_binary = _remove_text_components(raw_binary, rh, rw,
+                                         min_curve_span_ratio=0.08)
+    raw_binary = _remove_tick_marks(raw_binary, rh, rw)
+
+    # Mask out main curves (generous radius to remove thick solid curves)
+    if main_curves:
+        for _, pixels in main_curves.items():
+            for px, py in pixels:
+                lx, ly = px - p_left, py - p_top
+                for dy in range(-8, 9):
+                    for dx in range(-8, 9):
+                        ny, nx = ly + dy, lx + dx
+                        if 0 <= ny < rh and 0 <= nx < rw:
+                            raw_binary[ny, nx] = False
+
+    # Connected components on the remaining binary
+    structure = np.ones((3, 3), dtype=int)
+    labelled, n_comp = ndimage_label(raw_binary, structure=structure)
+
+    surge: Dict[int, List[Tuple[int, int]]] = {}
+    min_span_px = int(rw * min_span_ratio)
+
+    for comp_id in range(1, n_comp + 1):
+        comp_mask = labelled == comp_id
+        ys, xs = np.where(comp_mask)
+        n_px = len(xs)
+        if n_px < 15:
+            continue
+
+        x_span = int(xs.max() - xs.min()) + 1
+        y_span = int(ys.max() - ys.min()) + 1
+        if x_span < min_span_px:
+            continue
+
+        # Compute thickness: average number of foreground pixels per
+        # column — solid strokes have 1-3, thick dashes have more.
+        unique_x = np.unique(xs)
+        thickness = n_px / max(len(unique_x), 1)
+
+        # Dashed detection: project onto x-axis and look for gaps
+        x_sorted = np.sort(unique_x)
+        diffs = np.diff(x_sorted)
+        gaps = diffs[diffs > 2]
+        n_gaps = len(gaps)
+
+        # A dashed/dash-dot line has periodic gaps
+        has_gaps = n_gaps >= 2
+        gap_periodic = False
+        if n_gaps >= 3:
+            gap_mean = float(np.mean(gaps))
+            gap_std = float(np.std(gaps))
+            gap_periodic = (gap_std / max(gap_mean, 1)) < 1.0
+
+        # Skeleton dashed score on this component's skeleton
+        skel_mask = _skeletonize(comp_mask)
+        skel_pixels = list(zip(*np.where(skel_mask)[::-1]))  # (x,y)
+        if skel_pixels:
+            ds = score_dashed(skel_mask, skel_pixels)
+        else:
+            ds = 0.0
+
+        # Accept if:
+        #   - skeleton says dashed, OR
+        #   - binary shows gaps + either periodic or thick
+        is_surge = False
+        if ds >= dashed_threshold:
+            is_surge = True
+        if has_gaps and gap_periodic:
+            is_surge = True
+        if has_gaps and thickness >= 3.0 and n_gaps >= 3:
+            is_surge = True
+
+        if not is_surge:
+            continue
+
+        idx = len(surge)
+        # Build ordered pixel list from skeleton (or centerline)
+        if skel_pixels and len(skel_pixels) > 5:
+            ordered = order_pixels_to_polyline(skel_pixels)
+        else:
+            ordered = order_pixels_to_polyline(
+                list(zip(xs.tolist(), ys.tolist()))
+            )
+        full_pixels = [(x + p_left, y + p_top) for x, y in ordered]
+        surge[idx] = full_pixels
+        logger.info(
+            "extract_surge_lines: found component %d  "
+            "dashed_score=%.2f  gaps=%d  thickness=%.1f  span=%d  n_px=%d",
+            idx, ds, n_gaps, thickness, x_span, n_px,
+        )
+
+    logger.info("extract_surge_lines: extracted %d surge/dashed lines", len(surge))
+    return surge
 
 
 def _save_bw_debug_overlay(
