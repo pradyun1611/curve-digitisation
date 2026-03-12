@@ -40,6 +40,16 @@ logger = logging.getLogger(__name__)
 
 _DEBUG_DIR = os.environ.get("CURVE_DEBUG_IMAGES", "")
 
+# Last skeleton/binary produced by extract_bw_curves, for debug saving.
+_last_skeleton: Optional[np.ndarray] = None
+_last_binary: Optional[np.ndarray] = None
+_last_plot_area: Optional[Tuple[int, int, int, int]] = None
+
+
+def get_last_skeleton() -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[Tuple[int, int, int, int]]]:
+    """Return (skeleton, binary, plot_area) from the most recent extraction."""
+    return _last_skeleton, _last_binary, _last_plot_area
+
 
 def _save_debug(tag: str, array: np.ndarray) -> None:
     if not _DEBUG_DIR:
@@ -2243,12 +2253,19 @@ def extract_bw_curves(
     Dict[int, List[(x, y)]]
         Curve index → pixel coords in full-image space.
     """
+    global _last_skeleton, _last_binary, _last_plot_area
+
     cfg = config or DEFAULT_CONFIG
     p_left, p_top, p_right, p_bottom = plot_area
 
     # Step 1: Preprocess (enhanced with CLAHE, blackhat, adaptive, Hough)
     skeleton, binary, adj_area = preprocess_bw(image, plot_area, config=cfg)
     rh, rw = skeleton.shape
+
+    # Store for debug retrieval
+    _last_skeleton = skeleton
+    _last_binary = binary
+    _last_plot_area = plot_area
 
     # Pre-compute distance transform on binary for anchor tracing
     dt = distance_transform_edt(binary)

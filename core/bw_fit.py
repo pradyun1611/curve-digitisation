@@ -460,6 +460,13 @@ def fit_bw_curve(
             "num_bins_used": 0,
         }, list(axis_coords)
 
+    # Remember the FULL x-range of the original data (including anchor
+    # endpoints) so the fitted output covers the entire curve span,
+    # even if centerline extraction or outlier removal trims the edges.
+    all_xs = np.array([p[0] for p in axis_coords], dtype=np.float64)
+    orig_x_min = float(all_xs.min())
+    orig_x_max = float(all_xs.max())
+
     # 1. Centerline
     x_bin, y_bin = extract_centerline(
         axis_coords, min_points_per_bin=min_points_per_bin,
@@ -488,6 +495,22 @@ def fit_bw_curve(
 
     # 5. Shape sanity — enforce unimodal arc
     fit = _shape_sanity(fit, x_clean, y_smooth, n_output=n_output)
+
+    # 5b. Extend fitted points to cover the full original x-range.
+    #     Centerline extraction and outlier removal can shrink the
+    #     x-range, causing curves to start too late or end too early.
+    #     Re-evaluate the polynomial over the original range.
+    coeffs = fit.get("coefficients")
+    if coeffs is not None and (orig_x_max - orig_x_min) > 1e-12:
+        fit_x_min = fit["fitted_points"][0]["x"] if fit["fitted_points"] else orig_x_min
+        fit_x_max = fit["fitted_points"][-1]["x"] if fit["fitted_points"] else orig_x_max
+        if orig_x_min < fit_x_min - 1e-9 or orig_x_max > fit_x_max + 1e-9:
+            x_eval = np.linspace(orig_x_min, orig_x_max, n_output)
+            y_eval = np.polyval(coeffs, x_eval)
+            fit["fitted_points"] = [
+                {"x": float(xv), "y": float(yv)}
+                for xv, yv in zip(x_eval, y_eval)
+            ]
 
     # Add BW-specific metadata
     fit["num_bins_used"] = num_bins

@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 
 from core.router import classify_image_mode
-from core.bw_pipeline import extract_bw_curves, extract_surge_lines, smooth_curve
+from core.bw_pipeline import extract_bw_curves, extract_surge_lines, smooth_curve, get_last_skeleton
 from core.bw_fit import fit_bw_curve
 
 # ── Determinism: single-threaded BLAS/LAPACK ──────────────────────
@@ -848,21 +848,36 @@ class CurveDigitizer:
         # Clamp to reasonable range for chart images
         return max(40, min(best_t, 200))
 
+    @staticmethod
+    def _cluster_tick_indices(tick_indices: np.ndarray,
+                              max_gap: int = 3) -> List[List[int]]:
+        """Group adjacent indices into tick clusters (thick ticks span 2-4 px)."""
+        clusters: List[List[int]] = []
+        cur = [int(tick_indices[0])]
+        for i in range(1, len(tick_indices)):
+            if tick_indices[i] - tick_indices[i - 1] <= max_gap:
+                cur.append(int(tick_indices[i]))
+            else:
+                clusters.append(cur)
+                cur = [int(tick_indices[i])]
+        clusters.append(cur)
+        return clusters
+
     def _refine_plot_area_with_ticks(
         self,
         image: Image.Image,
         plot_area: Tuple[int, int, int, int],
     ) -> Tuple[int, int, int, int]:
-        """Refine plot-area top/bottom using y-axis tick marks.
+        """Refine all four plot-area boundaries using axis tick marks.
 
-        Tick marks are short horizontal dashes that protrude from the
-        y-axis line.  Their y-positions correspond to labelled axis
-        values, so the span from the first to the last tick mark gives a
-        more accurate effective plot height than the rough line-based
-        detection.
+        Y-axis ticks (horizontal dashes left of the y-axis) refine
+        top/bottom; X-axis ticks (vertical dashes below the x-axis)
+        refine left/right.  The tick positions correspond to labelled
+        axis values, so bounding by the first and last tick gives the
+        most accurate pixel↔axis mapping.
 
-        Only adjusts top/bottom boundaries; left/right are usually
-        already accurate from vertical-line detection.
+        Uses ``last_tick + 1`` for bottom/right so that the tick pixel
+        itself is included in the numpy slice (exclusive upper bound).
         """
         img_array = np.array(image)
         if img_array.ndim == 3:
@@ -872,66 +887,108 @@ class CurveDigitizer:
 
         height, width = gray.shape
         p_left, p_top, p_right, p_bottom = plot_area
+        dark_threshold = 100
 
-        # Examine column strip just LEFT of axis line
+        # ── Y-axis tick detection (refines top / bottom) ──────────
+        refined_top, refined_bottom = p_top, p_bottom
+
         tick_strip_w = min(20, p_left)
         strip_left = max(0, p_left - tick_strip_w)
         strip_right = p_left + 2  # include axis edge
-        if strip_right <= strip_left:
-            return plot_area
+        if strip_right > strip_left:
+            strip = gray[:, strip_left:strip_right]
+            dark_per_row = np.sum(strip < dark_threshold, axis=1)
 
-        strip = gray[:, strip_left:strip_right]
-        dark_threshold = 100
-        dark_per_row = np.sum(strip < dark_threshold, axis=1)
+            region_dark = dark_per_row[p_top:p_bottom]
+            if len(region_dark) > 0:
+                median_dark = float(np.median(region_dark))
+                tick_threshold = median_dark + max(1, median_dark * 0.3)
+                tick_rows_rel = np.where(region_dark >= tick_threshold)[0]
 
-        # Axis line itself is dark in almost every row within the plot.
-        # Tick marks add EXTRA dark pixels in their rows.
-        # Strategy: within the rough [p_top, p_bottom] region, find rows
-        # with above-median dark pixel count (tick marks stick out).
-        region_dark = dark_per_row[p_top:p_bottom]
-        if len(region_dark) == 0:
-            return plot_area
+                if len(tick_rows_rel) >= 2:
+                    y_clusters = self._cluster_tick_indices(tick_rows_rel)
+                    if len(y_clusters) >= 2:
+                        first_tick_y = int(np.mean(y_clusters[0])) + p_top
+                        last_tick_y = int(np.mean(y_clusters[-1])) + p_top
+                        tick_span = last_tick_y - first_tick_y
+                        if tick_span >= (p_bottom - p_top) * 0.3:
+                            # +1 on bottom so the tick row is INCLUDED
+                            # in numpy slice [top:bottom)
+                            cand_top = first_tick_y
+                            cand_bot = last_tick_y + 1
+                            if cand_top >= p_top - 10 and cand_bot <= p_bottom + 10:
+                                refined_top = cand_top
+                                refined_bottom = cand_bot
 
-        median_dark = float(np.median(region_dark))
-        tick_threshold = median_dark + max(1, median_dark * 0.3)
+        # ── X-axis tick detection (refines left / right) ──────────
+        refined_left, refined_right = p_left, p_right
 
-        tick_rows_rel = np.where(region_dark >= tick_threshold)[0]
-        if len(tick_rows_rel) < 2:
-            return plot_area
+        # Start the strip a few pixels BELOW the axis line so the
+        # continuous dark axis row doesn't drown out the tick signal.
+        # Cap depth at 12 px to avoid picking up axis-label text.
+        tick_strip_h = min(12, height - p_bottom)
+        strip_top_x = p_bottom + 2  # skip the axis line itself
+        strip_bot_x = min(height, p_bottom + max(tick_strip_h, 8))
+        # Widen column search beyond current boundaries so ticks just
+        # outside the rough detect_plot_area can still be found.
+        margin_x = max(50, int((p_right - p_left) * 0.08))
+        search_left = max(0, p_left - margin_x)
+        search_right = min(width, p_right + margin_x)
+        # Use a stricter brightness cutoff for x-ticks: below the axis
+        # line there is label text that passes the generous dark_threshold
+        # (100) but tick marks are solid black (< 80).
+        x_dark_thr = min(dark_threshold, 80)
+        if strip_bot_x > strip_top_x and search_right > search_left:
+            strip_x = gray[strip_top_x:strip_bot_x, :]
+            dark_per_col = np.sum(strip_x < x_dark_thr, axis=0)
 
-        # Cluster adjacent rows (thick ticks span 2-4 rows)
-        clusters: list = []
-        cur = [tick_rows_rel[0]]
-        for i in range(1, len(tick_rows_rel)):
-            if tick_rows_rel[i] - tick_rows_rel[i - 1] <= 3:
-                cur.append(tick_rows_rel[i])
-            else:
-                clusters.append(cur)
-                cur = [tick_rows_rel[i]]
-        clusters.append(cur)
+            region_dark_x = dark_per_col[search_left:search_right]
+            if len(region_dark_x) > 0:
+                median_dark_x = float(np.median(region_dark_x))
+                tick_threshold_x = median_dark_x + max(1, median_dark_x * 0.3)
+                tick_cols_rel = np.where(region_dark_x >= tick_threshold_x)[0]
 
-        if len(clusters) < 2:
-            return plot_area
+                if len(tick_cols_rel) >= 2:
+                    x_clusters = self._cluster_tick_indices(tick_cols_rel)
+                    if len(x_clusters) >= 2:
+                        # Compute cluster centers (absolute pixel coords)
+                        centers = [int(np.mean(c)) + search_left
+                                   for c in x_clusters]
 
-        # Centers of first and last tick cluster
-        first_tick_y = int(np.mean(clusters[0])) + p_top
-        last_tick_y = int(np.mean(clusters[-1])) + p_top
+                        # Periodicity filter: axis-corner artifacts
+                        # produce tiny spacings that differ from the
+                        # regular tick spacing.  Strip them from both
+                        # ends while there are ≥ 3 clusters remaining.
+                        if len(centers) >= 3:
+                            spacings = [centers[i + 1] - centers[i]
+                                        for i in range(len(centers) - 1)]
+                            med_sp = float(np.median(spacings))
+                            min_sp = med_sp * 0.5
+                            while (len(centers) >= 3
+                                   and centers[1] - centers[0] < min_sp):
+                                centers.pop(0)
+                            while (len(centers) >= 3
+                                   and centers[-1] - centers[-2] < min_sp):
+                                centers.pop()
 
-        # Only refine if tick span is reasonable (>30% of current height)
-        tick_span = last_tick_y - first_tick_y
-        current_height = p_bottom - p_top
-        if tick_span < current_height * 0.3:
-            return plot_area
+                        if len(centers) >= 2:
+                            first_tick_x = centers[0]
+                            last_tick_x = centers[-1]
+                            tick_span_x = last_tick_x - first_tick_x
+                            if tick_span_x >= (p_right - p_left) * 0.3:
+                                cand_left = first_tick_x
+                                cand_right = last_tick_x + 1
+                                if (cand_left >= p_left - margin_x
+                                        and cand_right <= p_right + margin_x):
+                                    refined_left = cand_left
+                                    refined_right = cand_right
 
-        # Use tick marks as refined top/bottom
-        refined_top = first_tick_y
-        refined_bottom = last_tick_y
-
-        # Sanity: don't expand beyond current bounds significantly
-        if refined_top >= p_top - 10 and refined_bottom <= p_bottom + 10:
-            return (p_left, refined_top, p_right, refined_bottom)
-
-        return plot_area
+        logger.debug(
+            "tick_refine: (%d,%d,%d,%d) → (%d,%d,%d,%d)",
+            p_left, p_top, p_right, p_bottom,
+            refined_left, refined_top, refined_right, refined_bottom,
+        )
+        return (refined_left, refined_top, refined_right, refined_bottom)
     
     def detect_plot_area(self, image: Image.Image, dark_threshold: int = 80,
                          line_ratio: float = 0.3) -> Tuple[int, int, int, int]:
@@ -1769,6 +1826,11 @@ class CurveDigitizer:
                         exclude_curve_mode=exclude_curve_mode,
                     )
                     results['extraction_method'] = 'skeleton'
+                    # Stash skeleton for debug saving later
+                    _skel, _bin, _skel_pa = get_last_skeleton()
+                    results['_debug_skeleton'] = _skel
+                    results['_debug_binary'] = _bin
+                    results['_debug_skeleton_plot_area'] = _skel_pa
                 else:
                     # ── LEGACY: column-scan tracker ──
                     gray_clusters = self.extract_curves_grayscale(
@@ -1903,6 +1965,10 @@ class CurveDigitizer:
                         'label': label, 'color': color_key,
                         'extraction_mode': 'grayscale',
                         'raw_pixel_points': pixels,
+                        'raw_axis_coords': [
+                            {'x': round(x, 4), 'y': round(y, 4)}
+                            for x, y in sorted(set(axis_coords))
+                        ],
                         'plot_area': list(plot_area),
                         'original_point_count': len(pixels),
                         'normalized_point_count': len(axis_coords),
@@ -2108,5 +2174,28 @@ class CurveDigitizer:
         saved_graphs = self.generate_digitized_graphs(results, instance_dir, timestamp)
         results['output_graphs'] = saved_graphs
         results['instance_dir'] = instance_dir
-        
+
+        # Save skeleton debug image to output folder
+        _dbg_skel = results.pop('_debug_skeleton', None)
+        _dbg_bin = results.pop('_debug_binary', None)
+        _dbg_skel_pa = results.pop('_debug_skeleton_plot_area', None)
+        if _dbg_skel is not None:
+            try:
+                skel_img = (_dbg_skel.astype(np.uint8) * 255)
+                skel_path = str(Path(instance_dir) / f"skeleton_{timestamp}.png")
+                Image.fromarray(skel_img).save(skel_path)
+                saved_graphs['skeleton'] = skel_path
+                logger.info("Saved skeleton debug image: %s", skel_path)
+            except Exception as _skel_err:
+                logger.debug("Failed to save skeleton debug image: %s", _skel_err)
+        if _dbg_bin is not None:
+            try:
+                bin_img = (_dbg_bin.astype(np.uint8) * 255)
+                bin_path = str(Path(instance_dir) / f"binary_{timestamp}.png")
+                Image.fromarray(bin_img).save(bin_path)
+                saved_graphs['binary'] = bin_path
+                logger.info("Saved binary debug image: %s", bin_path)
+            except Exception as _bin_err:
+                logger.debug("Failed to save binary debug image: %s", _bin_err)
+
         return results
