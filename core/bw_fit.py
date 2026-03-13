@@ -494,12 +494,16 @@ def fit_bw_curve(
                         n_output=n_output)
 
     # 5. Shape sanity — enforce unimodal arc
-    fit = _shape_sanity(fit, x_clean, y_smooth, n_output=n_output)
+    fit = _shape_sanity(fit, x_clean, y_smooth, n_output=n_output,
+                        max_d2_sign_changes=3, min_d2_dominance=0.70)
 
     # 5b. Extend fitted points to cover the full original x-range.
     #     Centerline extraction and outlier removal can shrink the
     #     x-range, causing curves to start too late or end too early.
     #     Re-evaluate the polynomial over the original range.
+    #     GUARD: for extrapolated regions (outside the fitted x-range),
+    #     use linear extension from the edge slope to prevent polynomial
+    #     divergence (high-degree polys can blow up beyond data bounds).
     coeffs = fit.get("coefficients")
     if coeffs is not None and (orig_x_max - orig_x_min) > 1e-12:
         fit_x_min = fit["fitted_points"][0]["x"] if fit["fitted_points"] else orig_x_min
@@ -507,6 +511,24 @@ def fit_bw_curve(
         if orig_x_min < fit_x_min - 1e-9 or orig_x_max > fit_x_max + 1e-9:
             x_eval = np.linspace(orig_x_min, orig_x_max, n_output)
             y_eval = np.polyval(coeffs, x_eval)
+
+            # Clamp extrapolated regions using linear extension from
+            # the polynomial's edge value + edge slope, preventing
+            # the curve from diverging wildly beyond the data range.
+            poly_deriv = np.polyder(coeffs)
+            # Left extrapolation
+            left_mask = x_eval < fit_x_min
+            if left_mask.any():
+                y_at_left = float(np.polyval(coeffs, fit_x_min))
+                slope_left = float(np.polyval(poly_deriv, fit_x_min))
+                y_eval[left_mask] = y_at_left + slope_left * (x_eval[left_mask] - fit_x_min)
+            # Right extrapolation
+            right_mask = x_eval > fit_x_max
+            if right_mask.any():
+                y_at_right = float(np.polyval(coeffs, fit_x_max))
+                slope_right = float(np.polyval(poly_deriv, fit_x_max))
+                y_eval[right_mask] = y_at_right + slope_right * (x_eval[right_mask] - fit_x_max)
+
             fit["fitted_points"] = [
                 {"x": float(xv), "y": float(yv)}
                 for xv, yv in zip(x_eval, y_eval)

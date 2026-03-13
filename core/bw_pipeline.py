@@ -243,12 +243,19 @@ def preprocess_bw(
     binary = _remove_gridlines_morph(binary, rh, rw)
     _save_debug("preprocess_no_grid", binary.astype(np.uint8) * 255)
 
-    # 2. Remove text BEFORE closing (prevents text merging with curves)
+    # 1b. Light close to reconnect curve fragments broken by grid
+    #     removal.  Grid gaps are typically 1-3 px wide.  A 3x9
+    #     kernel bridges both horizontal AND diagonal gaps (diagonal
+    #     lines crossing vertical gridlines need vertical bridging too).
+    grid_bridge_ck = np.ones((3, 9), dtype=bool)
+    binary = binary_closing(binary, structure=grid_bridge_ck, iterations=1)
+
+    # 2. Remove text BEFORE main closing (prevents text merging with curves)
     binary = _remove_text_components(binary, rh, rw,
                                      area_max_ratio=text_area_max_ratio,
                                      aspect_min=text_aspect_min,
                                      aspect_max=text_aspect_max,
-                                     min_curve_span_ratio=0.15)
+                                     min_curve_span_ratio=0.10)
     _save_debug("preprocess_no_text", binary.astype(np.uint8) * 255)
 
     # 3. Remove tick marks near axes
@@ -773,13 +780,19 @@ def _apply_blackhat(
     """Black-hat transform to highlight dark strokes on light background.
 
     blackhat = closing(gray) - gray
+
+    The raw blackhat output has curves as *bright* pixels and background
+    as *dark* pixels.  The rest of the pipeline expects dark = curve, so
+    we invert the result (255 - bh) before returning.
     """
     closed = grey_closing(gray, size=kernel_size)
     bh = closed.astype(np.int16) - gray.astype(np.int16)
     bh = np.clip(bh, 0, 255).astype(np.uint8)
     # Only use if it reveals meaningful contrast
     if bh.max() > 30:
-        return bh
+        # Invert so curves remain dark and background bright,
+        # matching the convention expected by downstream thresholding.
+        return (255 - bh).astype(np.uint8)
     logger.debug("blackhat max=%d too low, keeping original", bh.max())
     return gray
 
@@ -2294,7 +2307,7 @@ def extract_bw_curves(
             max_jump=0,          # auto
             jump_weight=0.3,
             curvature_weight=0.1,
-            min_span_ratio=0.15,  # relaxed: accept shorter curves
+            min_span_ratio=0.10,  # relaxed: accept shorter curves
         )
         if dp_curves:
             dp_curves_available = {
@@ -2421,9 +2434,42 @@ def extract_bw_curves(
                 logger.info("extract_bw_curves: seeded %d DP curves as fallback",
                             len(dp_curves_available))
 
-    # 2b) Iterative skeleton component selection (proven primary method)
-    #     Extract up to max(target, available) curves — let downstream
-    #     label-assignment and geometry filter decide which to keep.
+    # 2b) Column-scan on full binary as a supplementary extraction
+    #     method.  Only used when DP/skeleton fragments are too short.
+    #     NOTE: column-scan can pick up gridline remnants as horizontal
+    #     tracks, so only use tracks that show meaningful y-variation
+    #     (i.e., not nearly-horizontal).
+    remaining = target - len(result)
+    if remaining > 0:
+        cs_curves = _column_scan_extract(binary, target, min_coverage=0.30)
+        if cs_curves:
+            # Filter out nearly-horizontal tracks (likely gridline remnants)
+            cs_valid: Dict[int, List[Tuple[int, int]]] = {}
+            for cidx, pxs in cs_curves.items():
+                ys = [p[1] for p in pxs]
+                xs = [p[0] for p in pxs]
+                y_span = max(ys) - min(ys) if ys else 0
+                x_span = max(xs) - min(xs) if xs else 1
+                # Accept tracks with meaningful slope (y_span > 5% of image height)
+                if y_span > rh * 0.05 or x_span < rw * 0.30:
+                    cs_valid[len(cs_valid)] = pxs
+
+            if len(cs_valid) >= remaining:
+                # Check if column-scan tracks have better x-span coverage
+                cs_spans = [max(p[0] for p in pxs) - min(p[0] for p in pxs)
+                            for pxs in cs_valid.values()]
+                dp_spans = [max(p[0] - p_left for p in pxs) - min(p[0] - p_left for p in pxs)
+                            for pxs in result.values()] if result else [0]
+                if cs_spans and np.mean(cs_spans) > np.mean(dp_spans) * 1.2:
+                    result = {
+                        idx: [(x + p_left, y + p_top) for x, y in pxs]
+                        for idx, pxs in cs_valid.items()
+                    }
+                    logger.info("extract_bw_curves: column-scan replaced DP (%d tracks, avg_span=%.0f)",
+                                len(result), np.mean(cs_spans))
+
+    # 2b-iter) Iterative skeleton component selection
+    #     Only used when DP + column-scan didn't find enough curves.
     remaining = target - len(result)
     if remaining > 0:
         max_to_extract = max(target, 3)  # always try at least 3
@@ -2552,7 +2598,12 @@ def extract_bw_curves(
         for idx in list(result.keys()):
             pixels = result[idx]
             local_pixels = [(x - p_left, y - p_top) for x, y in pixels]
-            extended = extend_curve_ends(local_pixels, binary)
+            extended = extend_curve_ends(
+                local_pixels, binary,
+                search_radius=cfg.extend_search_radius,
+                cone_angle=cfg.extend_cone_angle,
+                max_extension=cfg.extend_max_extension,
+            )
             result[idx] = [(x + p_left, y + p_top) for x, y in extended]
 
     # Step 4: Smooth

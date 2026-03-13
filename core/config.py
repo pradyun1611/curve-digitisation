@@ -81,9 +81,9 @@ class BWPipelineConfig:
     surge_min_gaps: int = 2
 
     # ── Endpoint extension ──
-    extend_search_radius: int = 20
-    extend_cone_angle: float = 45.0
-    extend_max_extension: int = 100
+    extend_search_radius: int = 30
+    extend_cone_angle: float = 60.0
+    extend_max_extension: int = 250
 
     # ── Column-scan tracker (multi-curve) ──
     tracker_max_y_jump_ratio: float = 0.03

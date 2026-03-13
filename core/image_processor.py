@@ -1953,6 +1953,12 @@ class CurveDigitizer:
                     # polynomial degree 1-4 with shape sanity checks.
                     fit_result, cleaned_coords = fit_bw_curve(axis_coords)
 
+                    # Clamp fitted y-values to axis range (prevents polynomial
+                    # extrapolation from producing physically impossible values
+                    # like negative power or efficiency > 100%).
+                    for p in fit_result.get('fitted_points', []):
+                        p['y'] = max(self.yMin, min(self.yMax, p['y']))
+
                     reproj_info = {}
 
                     # Quality metrics (same as colour path)
